@@ -63,12 +63,15 @@ impl Endpoint {
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
         let (accept_tx, accept_rx) = mpsc::unbounded_channel();
 
-        tokio::spawn(drive(
-            socket.clone(),
-            routes.clone(),
-            accept_tx,
-            signing.verifying_key().to_bytes(),
-        ));
+        tokio::spawn(
+            Driver {
+                socket: socket.clone(),
+                routes: routes.clone(),
+                accept_tx,
+                our_key: signing.verifying_key().to_bytes(),
+            }
+            .run(),
+        );
 
         Ok(Self {
             socket,
@@ -124,37 +127,44 @@ impl Endpoint {
     }
 }
 
-/// The demultiplexer: read every datagram, route it to its connection, or accept a new one.
-async fn drive(
+/// The demultiplexer: reads every datagram, routing it to its connection or accepting a new one.
+struct Driver {
     socket: Arc<UdpSocket>,
     routes: Routes,
     accept_tx: mpsc::UnboundedSender<Connection>,
     our_key: [u8; wire::KEY_LEN],
-) {
-    let mut buf = [0u8; MAX_DATAGRAM];
-    loop {
-        let (len, from) = match socket.recv_from(&mut buf).await {
-            Ok(datagram) => datagram,
-            Err(_) => break,
-        };
-        let Ok(frame) = Frame::decode(&buf[..len]) else {
-            continue;
-        };
+}
 
-        // Route to an existing connection (lock released before any await).
-        let existing = routes.lock().unwrap().get(&from).cloned();
-        if let Some(tx) = existing {
-            let _ = tx.send(frame);
-            continue;
-        }
+impl Driver {
+    /// Run the demultiplexer until the socket errors.
+    async fn run(self) {
+        let mut buf = [0u8; MAX_DATAGRAM];
+        loop {
+            let (len, from) = match self.socket.recv_from(&mut buf).await {
+                Ok(datagram) => datagram,
+                Err(_) => break,
+            };
+            let Ok(frame) = Frame::decode(&buf[..len]) else {
+                continue;
+            };
 
-        // A new peer: only a Hello opens a connection.
-        if let Frame::Hello { key } = frame {
-            let (tx, rx) = mpsc::unbounded_channel();
-            routes.lock().unwrap().insert(from, tx);
-            let ack = Frame::HelloAck { key: our_key };
-            let _ = socket.send_to(&ack.to_bytes(), from).await;
-            let _ = accept_tx.send(Connection::new(socket.clone(), from, key, rx));
+            // Route to an existing connection (lock released before any await).
+            let existing = self.routes.lock().unwrap().get(&from).cloned();
+            if let Some(tx) = existing {
+                let _ = tx.send(frame);
+                continue;
+            }
+
+            // A new peer: only a Hello opens a connection.
+            if let Frame::Hello { key } = frame {
+                let (tx, rx) = mpsc::unbounded_channel();
+                self.routes.lock().unwrap().insert(from, tx);
+                let ack = Frame::HelloAck { key: self.our_key };
+                let _ = self.socket.send_to(&ack.to_bytes(), from).await;
+                let _ = self
+                    .accept_tx
+                    .send(Connection::new(self.socket.clone(), from, key, rx));
+            }
         }
     }
 }
