@@ -8,12 +8,12 @@
 //! Identity is an ed25519 public key. Phase 0 (in progress): a plaintext transport over UDP. Done so
 //! far: the wire codec, a two-message handshake, a socket demultiplexer (one background task owns the
 //! socket and routes frames to per-connection queues, keyed by peer address), unreliable datagrams,
-//! and reliable ordered streams ([`Connection::send_reliable`] / [`recv_reliable`], stop-and-wait with
-//! retransmission). Next: wrap those behind `AsyncRead` / `AsyncWrite` with a per-stream dispatcher
-//! (multiplexing, full-duplex), then connection ids (today one connection per peer address). Phase 1
-//! adds a Noise handshake so the identity becomes cryptographically real.
+//! and a reliable, full-duplex bidirectional stream exposed as `AsyncRead` / `AsyncWrite`
+//! ([`Connection::open_bi`] / [`accept_bi`], stop-and-wait with retransmission). Next: multiple streams
+//! per connection, then connection ids (today one connection per peer address). Phase 1 adds a Noise
+//! handshake so the identity becomes cryptographically real.
 //!
-//! [`recv_reliable`]: Connection::recv_reliable
+//! [`accept_bi`]: Connection::accept_bi
 
 pub mod stream;
 
@@ -22,11 +22,16 @@ mod wire;
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use tokio::io::{
+    AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, DuplexStream, ReadBuf,
+};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -41,6 +46,9 @@ const STREAM_CHUNK: usize = 1024;
 
 /// How long to wait for an ack before retransmitting a stream frame.
 const RETRANSMIT: Duration = Duration::from_millis(200);
+
+/// Buffer size of the in-process duplex bridging a stream's user half and its engine.
+const DUPLEX_BUF: usize = 64 * 1024;
 
 /// A peer-address routing table shared between the driver and connecting callers.
 type Routes = Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Frame>>>>;
@@ -170,16 +178,16 @@ impl Driver {
     }
 }
 
-/// An established quirk connection to one peer.
-///
-/// Carries the peer's identity from the handshake and unreliable datagrams. The identity is nominal
-/// and unauthenticated in phase 0; phase 1's Noise handshake makes it real. Reliable streams are the
-/// next slice.
+/// An established quirk connection to one peer: unreliable datagrams and one reliable, full-duplex
+/// bidirectional stream. A background dispatcher owns the inbound frames, routing datagrams to
+/// [`recv_datagram`](Connection::recv_datagram), stream data to the read half, and acks to the write
+/// half. The identity is nominal in phase 0; Noise makes it real in phase 1.
 pub struct Connection {
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     peer_key: [u8; wire::KEY_LEN],
-    inbound: mpsc::UnboundedReceiver<Frame>,
+    datagrams: mpsc::UnboundedReceiver<Bytes>,
+    stream: Mutex<Option<(SendStream, RecvStream)>>,
 }
 
 impl Connection {
@@ -189,11 +197,30 @@ impl Connection {
         peer_key: [u8; wire::KEY_LEN],
         inbound: mpsc::UnboundedReceiver<Frame>,
     ) -> Self {
+        let (datagram_tx, datagram_rx) = mpsc::unbounded_channel();
+        let (recv_engine, recv_user) = tokio::io::duplex(DUPLEX_BUF);
+        let (send_user, send_engine) = tokio::io::duplex(DUPLEX_BUF);
+        let (ack_tx, ack_rx) = mpsc::unbounded_channel();
+
+        tokio::spawn(dispatch(
+            inbound,
+            socket.clone(),
+            peer_addr,
+            datagram_tx,
+            recv_engine,
+            ack_tx,
+        ));
+        tokio::spawn(drive_sender(socket.clone(), peer_addr, send_engine, ack_rx));
+
         Self {
             socket,
             peer_addr,
             peer_key,
-            inbound,
+            datagrams: datagram_rx,
+            stream: Mutex::new(Some((
+                SendStream { inner: send_user },
+                RecvStream { inner: recv_user },
+            ))),
         }
     }
 
@@ -221,91 +248,142 @@ impl Connection {
 
     /// Receive the next datagram from the peer, or `None` once the connection is closed.
     pub async fn recv_datagram(&mut self) -> Option<Bytes> {
-        while let Some(frame) = self.inbound.recv().await {
-            if let Frame::Datagram { data } = frame {
-                return Some(data);
+        self.datagrams.recv().await
+    }
+
+    /// Take the connection's bidirectional stream: a write half and a read half. Available once.
+    pub fn open_bi(&self) -> Result<(SendStream, RecvStream), Error> {
+        self.stream.lock().unwrap().take().ok_or(Error::Closed)
+    }
+
+    /// The single stream is symmetric, so accepting it is the same as opening it.
+    pub fn accept_bi(&self) -> Result<(SendStream, RecvStream), Error> {
+        self.open_bi()
+    }
+}
+
+/// The writable half of a quirk stream. Bytes written are chunked and reliably delivered by the
+/// connection's send engine; `shutdown` finishes the stream.
+pub struct SendStream {
+    inner: DuplexStream,
+}
+
+impl AsyncWrite for SendStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// The readable half of a quirk stream, delivering reassembled bytes until the peer finishes.
+pub struct RecvStream {
+    inner: DuplexStream,
+}
+
+impl AsyncRead for RecvStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+/// The connection's receive engine: route each inbound frame to the datagram queue, the stream's read
+/// half (reassembling and acking), or the send engine (acks of our writes).
+async fn dispatch(
+    mut inbound: mpsc::UnboundedReceiver<Frame>,
+    socket: Arc<UdpSocket>,
+    peer_addr: SocketAddr,
+    datagram_tx: mpsc::UnboundedSender<Bytes>,
+    mut recv: DuplexStream,
+    ack_tx: mpsc::UnboundedSender<u32>,
+) {
+    let mut reassembler = StreamRx::new();
+    while let Some(frame) = inbound.recv().await {
+        match frame {
+            Frame::Datagram { data } => {
+                let _ = datagram_tx.send(data);
             }
+            Frame::Data { seq, bytes, .. } => {
+                let delivered = reassembler.accept(seq, bytes);
+                if !delivered.is_empty() {
+                    let _ = recv.write_all(&delivered).await;
+                }
+                let ack = Frame::Ack {
+                    stream: 0,
+                    seq: reassembler.ack(),
+                };
+                let _ = socket.send_to(&ack.to_bytes(), peer_addr).await;
+            }
+            Frame::Fin { .. } => {
+                let ack = Frame::Ack {
+                    stream: 0,
+                    seq: reassembler.ack(),
+                };
+                let _ = socket.send_to(&ack.to_bytes(), peer_addr).await;
+                let _ = recv.shutdown().await;
+            }
+            Frame::Ack { seq, .. } => {
+                let _ = ack_tx.send(seq);
+            }
+            _ => {}
         }
-        None
     }
+}
 
-    /// Reliably send `data` as one ordered stream, then finish. Stop-and-wait with retransmission on
-    /// timeout. Phase 0 has one stream per connection; streams and datagrams share the inbound queue,
-    /// so a connection does one at a time until the per-stream dispatcher lands.
-    pub async fn send_reliable(&mut self, data: &[u8]) -> Result<(), Error> {
-        for (seq, chunk) in data.chunks(STREAM_CHUNK).enumerate() {
-            self.send_until_acked(seq as u32, chunk).await?;
-        }
-        // Best-effort finish; a proper close handshake comes with the dispatcher.
-        let fin = Frame::Fin { stream: 0 }.to_bytes();
-        for _ in 0..3 {
-            self.socket
-                .send_to(&fin, self.peer_addr)
-                .await
-                .map_err(Error::Io)?;
-        }
-        Ok(())
-    }
-
-    async fn send_until_acked(&mut self, seq: u32, chunk: &[u8]) -> Result<(), Error> {
+/// The connection's send engine: read the user's writes, chunk them, and deliver each reliably with
+/// stop-and-wait retransmission, then finish the stream when the user closes the write half.
+async fn drive_sender(
+    socket: Arc<UdpSocket>,
+    peer_addr: SocketAddr,
+    mut send: DuplexStream,
+    mut ack_rx: mpsc::UnboundedReceiver<u32>,
+) {
+    let mut seq = 0u32;
+    let mut buf = vec![0u8; STREAM_CHUNK];
+    loop {
+        let read = match send.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
         let frame = Frame::Data {
             stream: 0,
             seq,
-            bytes: Bytes::copy_from_slice(chunk),
+            bytes: Bytes::copy_from_slice(&buf[..read]),
         }
         .to_bytes();
         loop {
-            self.socket
-                .send_to(&frame, self.peer_addr)
-                .await
-                .map_err(Error::Io)?;
-            loop {
-                match tokio::time::timeout(RETRANSMIT, self.next_ack()).await {
-                    Ok(Some(ack)) if ack > seq => return Ok(()),
-                    Ok(Some(_)) => continue, // a stale ack; keep waiting
-                    Ok(None) => return Err(Error::Closed),
-                    Err(_) => break, // timed out; retransmit
+            let _ = socket.send_to(&frame, peer_addr).await;
+            let acked = loop {
+                match tokio::time::timeout(RETRANSMIT, ack_rx.recv()).await {
+                    Ok(Some(ack)) if ack > seq => break true,
+                    Ok(Some(_)) => continue, // stale ack; keep waiting
+                    Ok(None) => return,      // channel closed; dispatcher gone
+                    Err(_) => break false,   // timed out; retransmit
                 }
+            };
+            if acked {
+                break;
             }
         }
+        seq += 1;
     }
-
-    async fn next_ack(&mut self) -> Option<u32> {
-        while let Some(frame) = self.inbound.recv().await {
-            if let Frame::Ack { seq, .. } = frame {
-                return Some(seq);
-            }
-        }
-        None
-    }
-
-    /// Receive a reliable ordered stream until the sender finishes.
-    pub async fn recv_reliable(&mut self) -> Result<Vec<u8>, Error> {
-        let mut reassembler = StreamRx::new();
-        let mut data = Vec::new();
-        while let Some(frame) = self.inbound.recv().await {
-            match frame {
-                Frame::Data { seq, bytes, .. } => {
-                    data.extend_from_slice(&reassembler.accept(seq, bytes));
-                    self.send_ack(reassembler.ack()).await?;
-                }
-                Frame::Fin { .. } => {
-                    let _ = self.send_ack(reassembler.ack()).await;
-                    return Ok(data);
-                }
-                _ => continue,
-            }
-        }
-        Err(Error::Closed)
-    }
-
-    async fn send_ack(&self, seq: u32) -> Result<(), Error> {
-        let ack = Frame::Ack { stream: 0, seq }.to_bytes();
-        self.socket
-            .send_to(&ack, self.peer_addr)
-            .await
-            .map_err(Error::Io)?;
-        Ok(())
+    let fin = Frame::Fin { stream: 0 }.to_bytes();
+    for _ in 0..3 {
+        let _ = socket.send_to(&fin, peer_addr).await;
     }
 }
 
