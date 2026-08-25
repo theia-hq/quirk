@@ -2,7 +2,7 @@
 //!
 //! A from-scratch, QUIC-shaped transport implemented to learn networking internals rather than wrap
 //! an existing stack (it is not built on quinn). quirk is standalone and knows nothing about bifrost;
-//! a separate `bifrost-quirk` adapter maps it onto the bifrost transport seam, exactly as
+//! a separate `bifrost-quirk` adapter maps it onto the bifrost transport interface, exactly as
 //! `bifrost-iroh` wraps iroh.
 //!
 //! Identity is an ed25519 public key. Phase 0 (in progress): a plaintext transport over UDP. Done so
