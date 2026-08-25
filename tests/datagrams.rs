@@ -19,10 +19,10 @@ async fn datagrams_flow_both_ways() {
     let mut connected = connected.unwrap();
 
     connected.send_datagram(b"ping").await.unwrap();
-    assert_eq!(accepted.recv_datagram().await.unwrap(), b"ping");
+    assert_eq!(accepted.recv_datagram().await.unwrap().as_ref(), b"ping");
 
     accepted.send_datagram(b"pong").await.unwrap();
-    assert_eq!(connected.recv_datagram().await.unwrap(), b"pong");
+    assert_eq!(connected.recv_datagram().await.unwrap().as_ref(), b"pong");
 }
 
 /// The demultiplexer lets one endpoint accept several connections at once (impossible with a direct

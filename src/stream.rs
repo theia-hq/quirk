@@ -4,12 +4,14 @@
 
 use std::collections::BTreeMap;
 
+use bytes::Bytes;
+
 /// Reassembles a reliable stream from per-frame `Data` segments: delivers bytes in order, drops
 /// duplicates, and buffers out-of-order segments until the gap fills.
 #[derive(Debug, Default)]
 pub struct StreamRx {
     next: u32,
-    buffered: BTreeMap<u32, Vec<u8>>,
+    buffered: BTreeMap<u32, Bytes>,
 }
 
 impl StreamRx {
@@ -19,7 +21,7 @@ impl StreamRx {
     }
 
     /// Accept a segment, returning the bytes that are now deliverable in order (possibly empty).
-    pub fn accept(&mut self, seq: u32, bytes: Vec<u8>) -> Vec<u8> {
+    pub fn accept(&mut self, seq: u32, bytes: Bytes) -> Vec<u8> {
         if seq < self.next {
             return Vec::new(); // already delivered; a retransmit
         }
@@ -46,27 +48,27 @@ mod tests {
     #[test]
     fn delivers_in_order() {
         let mut rx = StreamRx::new();
-        assert_eq!(rx.accept(0, b"a".to_vec()), b"a".to_vec());
-        assert_eq!(rx.accept(1, b"b".to_vec()), b"b".to_vec());
+        assert_eq!(rx.accept(0, Bytes::from_static(b"a")), b"a".to_vec());
+        assert_eq!(rx.accept(1, Bytes::from_static(b"b")), b"b".to_vec());
         assert_eq!(rx.ack(), 2);
     }
 
     #[test]
     fn buffers_out_of_order_then_drains() {
         let mut rx = StreamRx::new();
-        assert!(rx.accept(2, b"c".to_vec()).is_empty());
-        assert!(rx.accept(1, b"b".to_vec()).is_empty());
+        assert!(rx.accept(2, Bytes::from_static(b"c")).is_empty());
+        assert!(rx.accept(1, Bytes::from_static(b"b")).is_empty());
         assert_eq!(rx.ack(), 0);
-        assert_eq!(rx.accept(0, b"a".to_vec()), b"abc".to_vec());
+        assert_eq!(rx.accept(0, Bytes::from_static(b"a")), b"abc".to_vec());
         assert_eq!(rx.ack(), 3);
     }
 
     #[test]
     fn drops_duplicates() {
         let mut rx = StreamRx::new();
-        assert_eq!(rx.accept(0, b"a".to_vec()), b"a".to_vec());
-        assert!(rx.accept(0, b"a".to_vec()).is_empty());
-        assert_eq!(rx.accept(1, b"b".to_vec()), b"b".to_vec());
+        assert_eq!(rx.accept(0, Bytes::from_static(b"a")), b"a".to_vec());
+        assert!(rx.accept(0, Bytes::from_static(b"a")).is_empty());
+        assert_eq!(rx.accept(1, Bytes::from_static(b"b")), b"b".to_vec());
         assert_eq!(rx.ack(), 2);
     }
 }

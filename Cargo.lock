@@ -208,6 +208,7 @@ dependencies = [
 name = "quirk"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "ed25519-dalek",
  "rand",
  "thiserror",

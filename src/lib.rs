@@ -25,6 +25,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -209,7 +210,7 @@ impl Connection {
     /// Send an unreliable datagram to the peer.
     pub async fn send_datagram(&self, data: &[u8]) -> Result<(), Error> {
         let frame = Frame::Datagram {
-            data: data.to_vec(),
+            data: Bytes::copy_from_slice(data),
         };
         self.socket
             .send_to(&frame.to_bytes(), self.peer_addr)
@@ -219,7 +220,7 @@ impl Connection {
     }
 
     /// Receive the next datagram from the peer, or `None` once the connection is closed.
-    pub async fn recv_datagram(&mut self) -> Option<Vec<u8>> {
+    pub async fn recv_datagram(&mut self) -> Option<Bytes> {
         while let Some(frame) = self.inbound.recv().await {
             if let Frame::Datagram { data } = frame {
                 return Some(data);
@@ -250,7 +251,7 @@ impl Connection {
         let frame = Frame::Data {
             stream: 0,
             seq,
-            bytes: chunk.to_vec(),
+            bytes: Bytes::copy_from_slice(chunk),
         }
         .to_bytes();
         loop {

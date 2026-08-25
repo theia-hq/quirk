@@ -3,6 +3,8 @@
 //! One frame per UDP datagram: a 4-byte magic, a one-byte frame type, then the frame body. This
 //! module is pure bytes in and out; no I/O lives here.
 
+use bytes::Bytes;
+
 /// Magic prefixing every quirk datagram. Stray or foreign packets are rejected on decode.
 pub const MAGIC: [u8; 4] = *b"QRK0";
 
@@ -32,7 +34,7 @@ pub enum Frame {
     /// An unreliable datagram payload on an established connection.
     Datagram {
         /// The datagram bytes.
-        data: Vec<u8>,
+        data: Bytes,
     },
     /// A reliable stream data segment: the `seq`-th frame of stream `stream`.
     Data {
@@ -41,7 +43,7 @@ pub enum Frame {
         /// The per-frame sequence number within the stream.
         seq: u32,
         /// The segment bytes.
-        bytes: Vec<u8>,
+        bytes: Bytes,
     },
     /// Cumulative acknowledgement: the receiver has every segment below `seq` of `stream`.
     Ack {
@@ -111,7 +113,7 @@ impl Frame {
                 key: key_from(body)?,
             }),
             T_DATAGRAM => Ok(Frame::Datagram {
-                data: body.to_vec(),
+                data: Bytes::copy_from_slice(body),
             }),
             T_DATA => {
                 let (stream, rest) = read_u32(body)?;
@@ -119,7 +121,7 @@ impl Frame {
                 Ok(Frame::Data {
                     stream,
                     seq,
-                    bytes: rest.to_vec(),
+                    bytes: Bytes::copy_from_slice(rest),
                 })
             }
             T_ACK => {
@@ -195,9 +197,9 @@ mod tests {
     #[test]
     fn datagram_roundtrips() {
         roundtrips(Frame::Datagram {
-            data: b"hello overlay".to_vec(),
+            data: Bytes::from_static(b"hello overlay"),
         });
-        roundtrips(Frame::Datagram { data: Vec::new() });
+        roundtrips(Frame::Datagram { data: Bytes::new() });
     }
 
     #[test]
@@ -205,12 +207,12 @@ mod tests {
         roundtrips(Frame::Data {
             stream: 3,
             seq: 42,
-            bytes: b"payload".to_vec(),
+            bytes: Bytes::from_static(b"payload"),
         });
         roundtrips(Frame::Data {
             stream: 0,
             seq: 0,
-            bytes: Vec::new(),
+            bytes: Bytes::new(),
         });
     }
 
