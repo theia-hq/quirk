@@ -6,41 +6,61 @@
 //! `bifrost-iroh` wraps iroh.
 //!
 //! Identity is an ed25519 public key. Phase 0 (in progress): a plaintext transport over UDP. Done so
-//! far: the wire codec and a two-message handshake ([`Endpoint::connect`] / [`Endpoint::accept`])
-//! that exchanges identities. Next: a socket demultiplexer routing datagrams to per-connection
-//! queues, then reliable bidirectional streams. Phase 1 adds a Noise handshake so the identity
-//! becomes cryptographically real (static key = public key).
+//! far: the wire codec, a two-message handshake, a socket demultiplexer (one background task owns the
+//! socket and routes datagrams to per-connection queues, keyed by peer address), and unreliable
+//! datagrams. Next: reliable bidirectional streams; then connection ids (today one connection per
+//! peer address). Phase 1 adds a Noise handshake so the identity becomes cryptographically real.
 
 mod wire;
 
+use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
-use crate::wire::{DecodeError, Frame};
+use crate::wire::Frame;
 
 /// The largest datagram quirk will read. Comfortably below common path MTUs.
 const MAX_DATAGRAM: usize = 1500;
 
-/// A quirk endpoint: a bound UDP socket and the ed25519 identity it speaks for.
+/// A peer-address routing table shared between the driver and connecting callers.
+type Routes = Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Frame>>>>;
+
+/// A quirk endpoint: a bound UDP socket, its identity, and a background demultiplexer.
 pub struct Endpoint {
     socket: Arc<UdpSocket>,
     signing: SigningKey,
+    routes: Routes,
+    accept_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Connection>>,
 }
 
 impl Endpoint {
-    /// Bind to an ephemeral local UDP port with a fresh identity.
+    /// Bind to an ephemeral local UDP port with a fresh identity and start the demultiplexer.
     pub async fn bind() -> Result<Self, Error> {
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
             .await
             .map_err(Error::Bind)?;
+        let socket = Arc::new(socket);
         let signing = SigningKey::generate(&mut rand::rngs::OsRng);
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let (accept_tx, accept_rx) = mpsc::unbounded_channel();
+
+        tokio::spawn(drive(
+            socket.clone(),
+            routes.clone(),
+            accept_tx,
+            signing.verifying_key().to_bytes(),
+        ));
+
         Ok(Self {
-            socket: Arc::new(socket),
+            socket,
             signing,
+            routes,
+            accept_rx: tokio::sync::Mutex::new(accept_rx),
         })
     }
 
@@ -55,10 +75,10 @@ impl Endpoint {
     }
 
     /// Dial a peer and complete the plaintext handshake.
-    ///
-    /// Phase 0 reads the reply directly off the socket, so an endpoint serves one dial or one accept
-    /// at a time; the socket demultiplexer that lifts this restriction is the next step.
     pub async fn connect(&self, peer: SocketAddr) -> Result<Connection, Error> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        self.routes.lock().unwrap().insert(peer, tx);
+
         let hello = Frame::Hello {
             key: self.key_bytes(),
         };
@@ -67,31 +87,22 @@ impl Endpoint {
             .await
             .map_err(Error::Io)?;
 
-        let mut buf = [0u8; MAX_DATAGRAM];
-        let (len, _from) = self.socket.recv_from(&mut buf).await.map_err(Error::Io)?;
-        match Frame::decode(&buf[..len])? {
-            Frame::HelloAck { key } => Ok(Connection::new(peer, key)),
+        match rx.recv().await {
+            Some(Frame::HelloAck { key }) => {
+                Ok(Connection::new(self.socket.clone(), peer, key, rx))
+            }
             _ => Err(Error::Handshake),
         }
     }
 
-    /// Accept the next inbound handshake.
+    /// Accept the next inbound connection.
     pub async fn accept(&self) -> Result<Connection, Error> {
-        let mut buf = [0u8; MAX_DATAGRAM];
-        let (len, from) = self.socket.recv_from(&mut buf).await.map_err(Error::Io)?;
-        match Frame::decode(&buf[..len])? {
-            Frame::Hello { key } => {
-                let ack = Frame::HelloAck {
-                    key: self.key_bytes(),
-                };
-                self.socket
-                    .send_to(&ack.to_bytes(), from)
-                    .await
-                    .map_err(Error::Io)?;
-                Ok(Connection::new(from, key))
-            }
-            _ => Err(Error::Handshake),
-        }
+        self.accept_rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or(Error::Closed)
     }
 
     fn key_bytes(&self) -> [u8; wire::KEY_LEN] {
@@ -99,27 +110,69 @@ impl Endpoint {
     }
 }
 
+/// The demultiplexer: read every datagram, route it to its connection, or accept a new one.
+async fn drive(
+    socket: Arc<UdpSocket>,
+    routes: Routes,
+    accept_tx: mpsc::UnboundedSender<Connection>,
+    our_key: [u8; wire::KEY_LEN],
+) {
+    let mut buf = [0u8; MAX_DATAGRAM];
+    loop {
+        let (len, from) = match socket.recv_from(&mut buf).await {
+            Ok(datagram) => datagram,
+            Err(_) => break,
+        };
+        let Ok(frame) = Frame::decode(&buf[..len]) else {
+            continue;
+        };
+
+        // Route to an existing connection (lock released before any await).
+        let existing = routes.lock().unwrap().get(&from).cloned();
+        if let Some(tx) = existing {
+            let _ = tx.send(frame);
+            continue;
+        }
+
+        // A new peer: only a Hello opens a connection.
+        if let Frame::Hello { key } = frame {
+            let (tx, rx) = mpsc::unbounded_channel();
+            routes.lock().unwrap().insert(from, tx);
+            let ack = Frame::HelloAck { key: our_key };
+            let _ = socket.send_to(&ack.to_bytes(), from).await;
+            let _ = accept_tx.send(Connection::new(socket.clone(), from, key, rx));
+        }
+    }
+}
+
 /// An established quirk connection to one peer.
 ///
-/// Phase 0 carries the peer's identity from the handshake but no streams yet; the reliable stream
-/// layer arrives with the socket demultiplexer.
+/// Carries the peer's identity from the handshake and unreliable datagrams. The identity is nominal
+/// and unauthenticated in phase 0; phase 1's Noise handshake makes it real. Reliable streams are the
+/// next slice.
 pub struct Connection {
+    socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     peer_key: [u8; wire::KEY_LEN],
+    inbound: mpsc::UnboundedReceiver<Frame>,
 }
 
 impl Connection {
-    fn new(peer_addr: SocketAddr, peer_key: [u8; wire::KEY_LEN]) -> Self {
+    fn new(
+        socket: Arc<UdpSocket>,
+        peer_addr: SocketAddr,
+        peer_key: [u8; wire::KEY_LEN],
+        inbound: mpsc::UnboundedReceiver<Frame>,
+    ) -> Self {
         Self {
+            socket,
             peer_addr,
             peer_key,
+            inbound,
         }
     }
 
     /// The peer's raw ed25519 public key, as announced in the handshake.
-    ///
-    /// Nominal and unauthenticated in phase 0: nothing yet proves the peer holds the matching private
-    /// key. Phase 1's Noise handshake makes it real.
     pub fn peer_key(&self) -> [u8; wire::KEY_LEN] {
         self.peer_key
     }
@@ -127,6 +180,28 @@ impl Connection {
     /// The peer's socket address.
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
+    }
+
+    /// Send an unreliable datagram to the peer.
+    pub async fn send_datagram(&self, data: &[u8]) -> Result<(), Error> {
+        let frame = Frame::Datagram {
+            data: data.to_vec(),
+        };
+        self.socket
+            .send_to(&frame.to_bytes(), self.peer_addr)
+            .await
+            .map_err(Error::Io)?;
+        Ok(())
+    }
+
+    /// Receive the next datagram from the peer, or `None` once the connection is closed.
+    pub async fn recv_datagram(&mut self) -> Option<Vec<u8>> {
+        while let Some(frame) = self.inbound.recv().await {
+            if let Frame::Datagram { data } = frame {
+                return Some(data);
+            }
+        }
+        None
     }
 }
 
@@ -139,10 +214,10 @@ pub enum Error {
     /// Sending or receiving on the socket failed.
     #[error("socket io")]
     Io(#[source] io::Error),
-    /// A datagram could not be decoded.
-    #[error("decode frame")]
-    Decode(#[from] DecodeError),
     /// The peer sent a frame that does not belong at this point in the handshake.
     #[error("unexpected handshake frame")]
     Handshake,
+    /// The endpoint has shut down.
+    #[error("endpoint closed")]
+    Closed,
 }

@@ -11,6 +11,7 @@ pub const KEY_LEN: usize = 32;
 
 const T_HELLO: u8 = 0x01;
 const T_HELLO_ACK: u8 = 0x02;
+const T_DATAGRAM: u8 = 0x03;
 
 /// A single quirk protocol frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +25,11 @@ pub enum Frame {
     HelloAck {
         /// The responder's raw ed25519 public key.
         key: [u8; KEY_LEN],
+    },
+    /// An unreliable datagram payload on an established connection.
+    Datagram {
+        /// The datagram bytes.
+        data: Vec<u8>,
     },
 }
 
@@ -39,6 +45,10 @@ impl Frame {
             Frame::HelloAck { key } => {
                 buf.push(T_HELLO_ACK);
                 buf.extend_from_slice(key);
+            }
+            Frame::Datagram { data } => {
+                buf.push(T_DATAGRAM);
+                buf.extend_from_slice(data);
             }
         }
     }
@@ -60,6 +70,9 @@ impl Frame {
             }),
             T_HELLO_ACK => Ok(Frame::HelloAck {
                 key: key_from(body)?,
+            }),
+            T_DATAGRAM => Ok(Frame::Datagram {
+                data: body.to_vec(),
             }),
             other => Err(DecodeError::UnknownType(other)),
         }
@@ -101,6 +114,20 @@ mod tests {
         let frame = Frame::HelloAck {
             key: [9u8; KEY_LEN],
         };
+        assert_eq!(Frame::decode(&frame.to_bytes()), Ok(frame));
+    }
+
+    #[test]
+    fn datagram_roundtrips() {
+        let frame = Frame::Datagram {
+            data: b"hello overlay".to_vec(),
+        };
+        assert_eq!(Frame::decode(&frame.to_bytes()), Ok(frame));
+    }
+
+    #[test]
+    fn empty_datagram_roundtrips() {
+        let frame = Frame::Datagram { data: Vec::new() };
         assert_eq!(Frame::decode(&frame.to_bytes()), Ok(frame));
     }
 
