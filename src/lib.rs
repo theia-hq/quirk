@@ -7,9 +7,13 @@
 //!
 //! Identity is an ed25519 public key. Phase 0 (in progress): a plaintext transport over UDP. Done so
 //! far: the wire codec, a two-message handshake, a socket demultiplexer (one background task owns the
-//! socket and routes datagrams to per-connection queues, keyed by peer address), and unreliable
-//! datagrams. Next: reliable bidirectional streams; then connection ids (today one connection per
-//! peer address). Phase 1 adds a Noise handshake so the identity becomes cryptographically real.
+//! socket and routes frames to per-connection queues, keyed by peer address), unreliable datagrams,
+//! and reliable ordered streams ([`Connection::send_reliable`] / [`recv_reliable`], stop-and-wait with
+//! retransmission). Next: wrap those behind `AsyncRead` / `AsyncWrite` with a per-stream dispatcher
+//! (multiplexing, full-duplex), then connection ids (today one connection per peer address). Phase 1
+//! adds a Noise handshake so the identity becomes cryptographically real.
+//!
+//! [`recv_reliable`]: Connection::recv_reliable
 
 pub mod stream;
 
