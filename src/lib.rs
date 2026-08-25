@@ -202,15 +202,26 @@ impl Connection {
         let (send_user, send_engine) = tokio::io::duplex(DUPLEX_BUF);
         let (ack_tx, ack_rx) = mpsc::unbounded_channel();
 
-        tokio::spawn(dispatch(
-            inbound,
-            socket.clone(),
-            peer_addr,
-            datagram_tx,
-            recv_engine,
-            ack_tx,
-        ));
-        tokio::spawn(drive_sender(socket.clone(), peer_addr, send_engine, ack_rx));
+        tokio::spawn(
+            Dispatcher {
+                inbound,
+                socket: socket.clone(),
+                peer_addr,
+                datagram_tx,
+                recv: recv_engine,
+                ack_tx,
+            }
+            .run(),
+        );
+        tokio::spawn(
+            Sender {
+                socket: socket.clone(),
+                peer_addr,
+                send: send_engine,
+                ack_rx,
+            }
+            .run(),
+        );
 
         Self {
             socket,
@@ -301,89 +312,94 @@ impl AsyncRead for RecvStream {
     }
 }
 
-/// The connection's receive engine: route each inbound frame to the datagram queue, the stream's read
+/// The connection's receive engine: routes each inbound frame to the datagram queue, the stream's read
 /// half (reassembling and acking), or the send engine (acks of our writes).
-async fn dispatch(
-    mut inbound: mpsc::UnboundedReceiver<Frame>,
+struct Dispatcher {
+    inbound: mpsc::UnboundedReceiver<Frame>,
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     datagram_tx: mpsc::UnboundedSender<Bytes>,
-    mut recv: DuplexStream,
+    recv: DuplexStream,
     ack_tx: mpsc::UnboundedSender<u32>,
-) {
-    let mut reassembler = StreamRx::new();
-    while let Some(frame) = inbound.recv().await {
-        match frame {
-            Frame::Datagram { data } => {
-                let _ = datagram_tx.send(data);
-            }
-            Frame::Data { seq, bytes, .. } => {
-                let delivered = reassembler.accept(seq, bytes);
-                if !delivered.is_empty() {
-                    let _ = recv.write_all(&delivered).await;
+}
+
+impl Dispatcher {
+    async fn run(mut self) {
+        let mut reassembler = StreamRx::new();
+        while let Some(frame) = self.inbound.recv().await {
+            match frame {
+                Frame::Datagram { data } => {
+                    let _ = self.datagram_tx.send(data);
                 }
-                let ack = Frame::Ack {
-                    stream: 0,
-                    seq: reassembler.ack(),
-                };
-                let _ = socket.send_to(&ack.to_bytes(), peer_addr).await;
+                Frame::Data { seq, bytes, .. } => {
+                    let delivered = reassembler.accept(seq, bytes);
+                    if !delivered.is_empty() {
+                        let _ = self.recv.write_all(&delivered).await;
+                    }
+                    self.send_ack(reassembler.ack()).await;
+                }
+                Frame::Fin { .. } => {
+                    self.send_ack(reassembler.ack()).await;
+                    let _ = self.recv.shutdown().await;
+                }
+                Frame::Ack { seq, .. } => {
+                    let _ = self.ack_tx.send(seq);
+                }
+                _ => {}
             }
-            Frame::Fin { .. } => {
-                let ack = Frame::Ack {
-                    stream: 0,
-                    seq: reassembler.ack(),
-                };
-                let _ = socket.send_to(&ack.to_bytes(), peer_addr).await;
-                let _ = recv.shutdown().await;
-            }
-            Frame::Ack { seq, .. } => {
-                let _ = ack_tx.send(seq);
-            }
-            _ => {}
         }
+    }
+
+    async fn send_ack(&self, seq: u32) {
+        let ack = Frame::Ack { stream: 0, seq };
+        let _ = self.socket.send_to(&ack.to_bytes(), self.peer_addr).await;
     }
 }
 
-/// The connection's send engine: read the user's writes, chunk them, and deliver each reliably with
-/// stop-and-wait retransmission, then finish the stream when the user closes the write half.
-async fn drive_sender(
+/// The connection's send engine: reads the user's writes, chunks them, delivers each reliably with
+/// stop-and-wait retransmission, then finishes the stream when the user closes the write half.
+struct Sender {
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
-    mut send: DuplexStream,
-    mut ack_rx: mpsc::UnboundedReceiver<u32>,
-) {
-    let mut seq = 0u32;
-    let mut buf = vec![0u8; STREAM_CHUNK];
-    loop {
-        let read = match send.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => read,
-        };
-        let frame = Frame::Data {
-            stream: 0,
-            seq,
-            bytes: Bytes::copy_from_slice(&buf[..read]),
-        }
-        .to_bytes();
+    send: DuplexStream,
+    ack_rx: mpsc::UnboundedReceiver<u32>,
+}
+
+impl Sender {
+    async fn run(mut self) {
+        let mut seq = 0u32;
+        let mut buf = vec![0u8; STREAM_CHUNK];
         loop {
-            let _ = socket.send_to(&frame, peer_addr).await;
-            let acked = loop {
-                match tokio::time::timeout(RETRANSMIT, ack_rx.recv()).await {
-                    Ok(Some(ack)) if ack > seq => break true,
-                    Ok(Some(_)) => continue, // stale ack; keep waiting
-                    Ok(None) => return,      // channel closed; dispatcher gone
-                    Err(_) => break false,   // timed out; retransmit
-                }
+            let read = match self.send.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
             };
-            if acked {
-                break;
+            let frame = Frame::Data {
+                stream: 0,
+                seq,
+                bytes: Bytes::copy_from_slice(&buf[..read]),
             }
+            .to_bytes();
+            loop {
+                let _ = self.socket.send_to(&frame, self.peer_addr).await;
+                let acked = loop {
+                    match tokio::time::timeout(RETRANSMIT, self.ack_rx.recv()).await {
+                        Ok(Some(ack)) if ack > seq => break true,
+                        Ok(Some(_)) => continue, // stale ack; keep waiting
+                        Ok(None) => return,      // channel closed; dispatcher gone
+                        Err(_) => break false,   // timed out; retransmit
+                    }
+                };
+                if acked {
+                    break;
+                }
+            }
+            seq += 1;
         }
-        seq += 1;
-    }
-    let fin = Frame::Fin { stream: 0 }.to_bytes();
-    for _ in 0..3 {
-        let _ = socket.send_to(&fin, peer_addr).await;
+        let fin = Frame::Fin { stream: 0 }.to_bytes();
+        for _ in 0..3 {
+            let _ = self.socket.send_to(&fin, self.peer_addr).await;
+        }
     }
 }
 
