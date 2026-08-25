@@ -19,15 +19,23 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+use crate::stream::StreamRx;
 use crate::wire::Frame;
 
 /// The largest datagram quirk will read. Comfortably below common path MTUs.
 const MAX_DATAGRAM: usize = 1500;
+
+/// The payload size of each reliable-stream data frame.
+const STREAM_CHUNK: usize = 1024;
+
+/// How long to wait for an ack before retransmitting a stream frame.
+const RETRANSMIT: Duration = Duration::from_millis(200);
 
 /// A peer-address routing table shared between the driver and connecting callers.
 type Routes = Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Frame>>>>;
@@ -204,6 +212,85 @@ impl Connection {
             }
         }
         None
+    }
+
+    /// Reliably send `data` as one ordered stream, then finish. Stop-and-wait with retransmission on
+    /// timeout. Phase 0 has one stream per connection; streams and datagrams share the inbound queue,
+    /// so a connection does one at a time until the per-stream dispatcher lands.
+    pub async fn send_reliable(&mut self, data: &[u8]) -> Result<(), Error> {
+        for (seq, chunk) in data.chunks(STREAM_CHUNK).enumerate() {
+            self.send_until_acked(seq as u32, chunk).await?;
+        }
+        // Best-effort finish; a proper close handshake comes with the dispatcher.
+        let fin = Frame::Fin { stream: 0 }.to_bytes();
+        for _ in 0..3 {
+            self.socket
+                .send_to(&fin, self.peer_addr)
+                .await
+                .map_err(Error::Io)?;
+        }
+        Ok(())
+    }
+
+    async fn send_until_acked(&mut self, seq: u32, chunk: &[u8]) -> Result<(), Error> {
+        let frame = Frame::Data {
+            stream: 0,
+            seq,
+            bytes: chunk.to_vec(),
+        }
+        .to_bytes();
+        loop {
+            self.socket
+                .send_to(&frame, self.peer_addr)
+                .await
+                .map_err(Error::Io)?;
+            loop {
+                match tokio::time::timeout(RETRANSMIT, self.next_ack()).await {
+                    Ok(Some(ack)) if ack > seq => return Ok(()),
+                    Ok(Some(_)) => continue, // a stale ack; keep waiting
+                    Ok(None) => return Err(Error::Closed),
+                    Err(_) => break, // timed out; retransmit
+                }
+            }
+        }
+    }
+
+    async fn next_ack(&mut self) -> Option<u32> {
+        while let Some(frame) = self.inbound.recv().await {
+            if let Frame::Ack { seq, .. } = frame {
+                return Some(seq);
+            }
+        }
+        None
+    }
+
+    /// Receive a reliable ordered stream until the sender finishes.
+    pub async fn recv_reliable(&mut self) -> Result<Vec<u8>, Error> {
+        let mut reassembler = StreamRx::new();
+        let mut data = Vec::new();
+        while let Some(frame) = self.inbound.recv().await {
+            match frame {
+                Frame::Data { seq, bytes, .. } => {
+                    data.extend_from_slice(&reassembler.accept(seq, bytes));
+                    self.send_ack(reassembler.ack()).await?;
+                }
+                Frame::Fin { .. } => {
+                    let _ = self.send_ack(reassembler.ack()).await;
+                    return Ok(data);
+                }
+                _ => continue,
+            }
+        }
+        Err(Error::Closed)
+    }
+
+    async fn send_ack(&self, seq: u32) -> Result<(), Error> {
+        let ack = Frame::Ack { stream: 0, seq }.to_bytes();
+        self.socket
+            .send_to(&ack, self.peer_addr)
+            .await
+            .map_err(Error::Io)?;
+        Ok(())
     }
 }
 
