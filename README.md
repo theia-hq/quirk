@@ -1,30 +1,48 @@
 # quirk
 
-Our own QUIC transport, implemented from scratch over UDP — a play on "QUIC". quirk is a `bifrost`
-transport backend: it establishes authenticated sessions to a `NodeId` by speaking a QUIC-shaped
-protocol we build ourselves, to learn the internals rather than wrap an existing stack.
+Our own QUIC, from scratch over UDP — a play on "QUIC". A learning experiment: we implement the QUIC
+transport machinery ourselves (framing, handshake, streams, reliability) to understand how it works,
+rather than reach for an existing stack.
 
-> Experimental and incomplete. A learning implementation: not ready for production use and not
-> interoperable with standard QUIC.
+> Experimental and incomplete. A learning implementation: not production-ready, and not interoperable
+> with standard QUIC.
+
+## What's implemented
+
+- **Wire codec** — magic-prefixed frames (`Hello`, `HelloAck`, `Datagram`, `Data`, `Ack`, `Fin`), pure
+  bytes in and out.
+- **Handshake** — two endpoints exchange ed25519 identities over UDP.
+- **Socket demultiplexer** — one background task owns the UDP socket and routes packets to the right
+  connection by peer address, so an endpoint handles many connections at once.
+- **Unreliable datagrams** — fire-and-forget messages on a connection.
+- **Reliable bidirectional streams** — a full-duplex `AsyncRead` + `AsyncWrite` pair per connection,
+  with in-order reassembly and stop-and-wait retransmission.
+
+Not yet: a Noise handshake (identity is nominal today), multiple streams per connection, connection
+ids, congestion control, and NAT traversal.
 
 ## Usage
 
-quirk implements `bifrost_transport::Transport`, so it composes into a `bifrost` `Node` like any other
-transport:
-
 ```rust
-use bifrost::Node;
+use quirk::Endpoint;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-let node = Node::new(quirk::Endpoint::bind().await?, discovery);
+// Acceptor: bind, share its address, accept a connection and its stream.
+let acceptor = Endpoint::bind().await?;
+let address = acceptor.local_addr()?;
+
+// Dialer: bind, connect to that address, open the bidirectional stream.
+let dialer = Endpoint::bind().await?;
+let connection = dialer.connect(address).await?;
+let (mut writer, mut reader) = connection.open_bi()?;
+
+writer.write_all(b"hello").await?;
+writer.shutdown().await?;
+let mut echo = Vec::new();
+reader.read_to_end(&mut echo).await?;
 ```
 
-## Things to know
-
-- Not quinn-based and not standards-compliant QUIC. quirk implements the transport machinery itself
-  (packets, streams, flow control, loss recovery); `bifrost-iroh` is the standards-compliant path.
-- Crypto is a Noise handshake (static key = `NodeId`), not TLS. Phase 0 runs plaintext with a nominal,
-  unauthenticated identity; phase 1 adds the handshake.
-- Held to the same behaviour as every bifrost transport by `bifrost-conformance`.
+Datagrams are `connection.send_datagram(&bytes).await?` and `connection.recv_datagram().await`.
 
 ## License
 
