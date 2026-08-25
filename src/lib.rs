@@ -11,6 +11,8 @@
 //! datagrams. Next: reliable bidirectional streams; then connection ids (today one connection per
 //! peer address). Phase 1 adds a Noise handshake so the identity becomes cryptographically real.
 
+pub mod stream;
+
 mod wire;
 
 use std::collections::HashMap;
