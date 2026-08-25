@@ -271,6 +271,10 @@ impl Connection {
     pub fn accept_bi(&self) -> Result<(SendStream, RecvStream), Error> {
         self.open_bi()
     }
+
+    /// Wait for the connection to finish. Phase 0: the send/recv engines are detached tasks that drain
+    /// buffered data independently and the peer's read gates delivery, so this is currently a no-op.
+    pub async fn wait_closed(&self) {}
 }
 
 /// The writable half of a quirk stream. Bytes written are chunked and reliably delivered by the
