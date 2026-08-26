@@ -20,6 +20,11 @@ pub mod stream;
 
 mod wire;
 
+#[cfg(test)]
+mod stream_tests;
+#[cfg(test)]
+mod wire_tests;
+
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
