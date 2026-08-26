@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use rand::rngs::OsRng;
 use tokio::io::{
     AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, DuplexStream, ReadBuf,
 };
@@ -118,13 +119,33 @@ pub struct Endpoint {
 impl Endpoint {
     /// Bind to an ephemeral local UDP port with a fresh identity and start the demultiplexer.
     pub async fn bind() -> Result<Self, Error> {
-        Self::bind_socket(Socket::Plain(Self::udp().await?)).await
+        Self::bind_socket(
+            Socket::Plain(Self::udp().await?),
+            SigningKey::generate(&mut OsRng),
+        )
+        .await
+    }
+
+    /// Bind with a persisted identity, from a raw 32-byte ed25519 secret, so the public key is stable
+    /// across runs. Mirrors [`bind`](Self::bind) in every other respect. The ed25519 verifying key is
+    /// derived from the same secret bytes iroh derives its key from, so the resulting identity is
+    /// identical across both transports: the same key file yields the same address whichever is bound.
+    pub async fn bind_with_secret(secret: [u8; 32]) -> Result<Self, Error> {
+        Self::bind_socket(
+            Socket::Plain(Self::udp().await?),
+            SigningKey::from_bytes(&secret),
+        )
+        .await
     }
 
     /// Bind an endpoint whose socket applies a deterministic [`Faults`] schedule, for tests that must
     /// exercise the reliability layer against a lossy, reordering link rather than lossless loopback.
     pub async fn bind_lossy(faults: Faults) -> Result<Self, Error> {
-        Self::bind_socket(Socket::Faulty(Faulty::new(Self::udp().await?, faults))).await
+        Self::bind_socket(
+            Socket::Faulty(Faulty::new(Self::udp().await?, faults)),
+            SigningKey::generate(&mut OsRng),
+        )
+        .await
     }
 
     async fn udp() -> Result<UdpSocket, Error> {
@@ -133,9 +154,8 @@ impl Endpoint {
             .map_err(Error::Bind)
     }
 
-    async fn bind_socket(socket: Socket) -> Result<Self, Error> {
+    async fn bind_socket(socket: Socket, signing: SigningKey) -> Result<Self, Error> {
         let socket = Arc::new(socket);
-        let signing = SigningKey::generate(&mut rand::rngs::OsRng);
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
         let generations = Arc::new(AtomicU64::new(0));
         let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_CAPACITY);
