@@ -1,21 +1,25 @@
 # quirk
 
-Our own QUIC, from scratch over UDP — a play on "QUIC". A learning experiment: we implement the QUIC
-transport machinery ourselves (framing, handshake, streams, reliability) to understand how it works,
-rather than reach for an existing stack.
+Our own QUIC, built from scratch over UDP to learn how the transport machinery (framing, handshake,
+streams, reliability) actually works, rather than reach for an existing stack. The name is a play on
+"QUIC".
+
+quirk is also a real `bifrost` transport, not just a toy: an out-of-tree `bifrost-quirk` adapter makes
+it pass the same `reach` conformance suite as iroh and the in-memory transport. The same app, dialing
+the same identity, runs unchanged over our own QUIC.
 
 > Experimental and incomplete. A learning implementation: not production-ready, and not interoperable
 > with standard QUIC.
 
 ## What's implemented
 
-- **Wire codec** — magic-prefixed frames (`Hello`, `HelloAck`, `Datagram`, `Data`, `Ack`, `Fin`), pure
+- **Wire codec.** Magic-prefixed frames (`Hello`, `HelloAck`, `Datagram`, `Data`, `Ack`, `Fin`); pure
   bytes in and out.
-- **Handshake** — two endpoints exchange ed25519 identities over UDP.
-- **Socket demultiplexer** — one background task owns the UDP socket and routes packets to the right
+- **Handshake.** Two endpoints exchange ed25519 identities over UDP.
+- **Socket demultiplexer.** One background task owns the UDP socket and routes packets to the right
   connection by peer address, so an endpoint handles many connections at once.
-- **Unreliable datagrams** — fire-and-forget messages on a connection.
-- **Reliable bidirectional streams** — a full-duplex `AsyncRead` + `AsyncWrite` pair per connection,
+- **Unreliable datagrams.** Fire-and-forget messages on a connection.
+- **Reliable bidirectional streams.** A full-duplex `AsyncRead` + `AsyncWrite` pair per connection,
   with in-order reassembly and stop-and-wait retransmission.
 
 Not yet: a Noise handshake (identity is nominal today), multiple streams per connection, connection
