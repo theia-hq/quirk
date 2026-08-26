@@ -15,6 +15,7 @@
 //!
 //! [`accept_bi`]: Connection::accept_bi
 
+pub mod socket;
 pub mod stream;
 
 mod wire;
@@ -23,6 +24,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -35,6 +37,7 @@ use tokio::io::{
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+use crate::socket::{Faults, Faulty, Socket};
 use crate::stream::StreamRx;
 use crate::wire::Frame;
 
@@ -50,32 +53,90 @@ const RETRANSMIT: Duration = Duration::from_millis(200);
 /// Buffer size of the in-process duplex bridging a stream's user half and its engine.
 const DUPLEX_BUF: usize = 64 * 1024;
 
+/// How many inbound connections may await [`Endpoint::accept`] before a flooding dialer is shed.
+/// Bounded so a peer opening connections faster than the application accepts them cannot grow memory
+/// without limit; excess `Hello`s are dropped and the dialer, seeing no `HelloAck`, retries or fails.
+const ACCEPT_CAPACITY: usize = 128;
+
+/// How many undispatched frames may queue per connection before further arrivals are shed. Stop-and-
+/// wait keeps at most one data frame outstanding, so a small window suffices for the honest path; a
+/// flooding peer that overruns it simply looks like a lossy link, and the reliability layer recovers.
+const INBOUND_CAPACITY: usize = 256;
+
+/// How many received datagrams may queue for the application before the oldest are shed. Datagrams are
+/// unreliable by definition, so dropping under flood is the contract, not a failure.
+const DATAGRAM_CAPACITY: usize = 256;
+
+/// How many acks may queue for the send engine before further acks are shed. Acks are cumulative and
+/// stop-and-wait needs only the latest, so a dropped ack at most triggers one retransmit.
+const ACK_CAPACITY: usize = 64;
+
 /// A peer-address routing table shared between the driver and connecting callers.
-type Routes = Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Frame>>>>;
+///
+/// Entries are pruned when the owning [`Connection`] drops (see its `Drop` impl), so a closed
+/// connection cannot leave a dead sender behind for a peer reusing the same address to be routed into.
+/// Each entry carries a generation so a dropping connection removes only its own route and never a
+/// newer one installed for the same address by a peer that redialed before the old drop ran.
+type Routes = Arc<Mutex<HashMap<SocketAddr, Route>>>;
+
+/// One entry in the routing table: the inbound-frame sender for a connection, tagged with the
+/// generation that installed it.
+struct Route {
+    generation: u64,
+    inbound: mpsc::Sender<Frame>,
+}
+
+/// Remove `peer`'s route only if it is still the one installed at `generation`. A newer route for the
+/// same address (a peer that redialed before an old connection's drop ran) is left in place.
+fn prune_route(routes: &Routes, peer: SocketAddr, generation: u64) {
+    let mut routes = routes.lock().expect("routes never poisoned");
+    if routes
+        .get(&peer)
+        .is_some_and(|route| route.generation == generation)
+    {
+        routes.remove(&peer);
+    }
+}
 
 /// A quirk endpoint: a bound UDP socket, its identity, and a background demultiplexer.
 pub struct Endpoint {
-    socket: Arc<UdpSocket>,
+    socket: Arc<Socket>,
     signing: SigningKey,
     routes: Routes,
-    accept_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Connection>>,
+    generations: Arc<AtomicU64>,
+    accept_rx: tokio::sync::Mutex<mpsc::Receiver<Connection>>,
 }
 
 impl Endpoint {
     /// Bind to an ephemeral local UDP port with a fresh identity and start the demultiplexer.
     pub async fn bind() -> Result<Self, Error> {
-        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        Self::bind_socket(Socket::Plain(Self::udp().await?)).await
+    }
+
+    /// Bind an endpoint whose socket applies a deterministic [`Faults`] schedule, for tests that must
+    /// exercise the reliability layer against a lossy, reordering link rather than lossless loopback.
+    pub async fn bind_lossy(faults: Faults) -> Result<Self, Error> {
+        Self::bind_socket(Socket::Faulty(Faulty::new(Self::udp().await?, faults))).await
+    }
+
+    async fn udp() -> Result<UdpSocket, Error> {
+        UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
             .await
-            .map_err(Error::Bind)?;
+            .map_err(Error::Bind)
+    }
+
+    async fn bind_socket(socket: Socket) -> Result<Self, Error> {
         let socket = Arc::new(socket);
         let signing = SigningKey::generate(&mut rand::rngs::OsRng);
         let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
-        let (accept_tx, accept_rx) = mpsc::unbounded_channel();
+        let generations = Arc::new(AtomicU64::new(0));
+        let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_CAPACITY);
 
         tokio::spawn(
             Driver {
-                socket: socket.clone(),
-                routes: routes.clone(),
+                socket: Arc::clone(&socket),
+                routes: Arc::clone(&routes),
+                generations: Arc::clone(&generations),
                 accept_tx,
                 our_key: signing.verifying_key().to_bytes(),
             }
@@ -86,6 +147,7 @@ impl Endpoint {
             socket,
             signing,
             routes,
+            generations,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
         })
     }
@@ -102,8 +164,15 @@ impl Endpoint {
 
     /// Dial a peer and complete the plaintext handshake.
     pub async fn connect(&self, peer: SocketAddr) -> Result<Connection, Error> {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        self.routes.lock().unwrap().insert(peer, tx);
+        let (tx, mut rx) = mpsc::channel(INBOUND_CAPACITY);
+        let generation = self.generations.fetch_add(1, Ordering::Relaxed);
+        self.routes.lock().expect("routes never poisoned").insert(
+            peer,
+            Route {
+                generation,
+                inbound: tx,
+            },
+        );
 
         let hello = Frame::Hello {
             key: self.key_bytes(),
@@ -113,11 +182,29 @@ impl Endpoint {
             .await
             .map_err(Error::Io)?;
 
-        match rx.recv().await {
-            Some(Frame::HelloAck { key }) => {
-                Ok(Connection::new(self.socket.clone(), peer, key, rx))
+        // Await the HelloAck, skipping any late frames still draining from a prior connection at this
+        // reused address (a stray stale ack must not be mistaken for a failed handshake). The channel
+        // closing means the endpoint is gone.
+        loop {
+            match rx.recv().await {
+                Some(Frame::HelloAck { key }) => {
+                    return Ok(Connection::new(
+                        Arc::clone(&self.socket),
+                        Arc::clone(&self.routes),
+                        generation,
+                        peer,
+                        key,
+                        rx,
+                    ));
+                }
+                Some(_) => continue,
+                None => {
+                    // The endpoint shut down before the handshake completed. Prune only our own route
+                    // so a concurrent redial's entry is untouched.
+                    prune_route(&self.routes, peer, generation);
+                    return Err(Error::Handshake);
+                }
             }
-            _ => Err(Error::Handshake),
         }
     }
 
@@ -138,9 +225,10 @@ impl Endpoint {
 
 /// The demultiplexer: reads every datagram, routing it to its connection or accepting a new one.
 struct Driver {
-    socket: Arc<UdpSocket>,
+    socket: Arc<Socket>,
     routes: Routes,
-    accept_tx: mpsc::UnboundedSender<Connection>,
+    generations: Arc<AtomicU64>,
+    accept_tx: mpsc::Sender<Connection>,
     our_key: [u8; wire::KEY_LEN],
 }
 
@@ -157,22 +245,60 @@ impl Driver {
                 continue;
             };
 
-            // Route to an existing connection (lock released before any await).
-            let existing = self.routes.lock().unwrap().get(&from).cloned();
-            if let Some(tx) = existing {
-                let _ = tx.send(frame);
+            // A `Hello` always (re)opens a connection: it signals a peer starting a fresh session, so
+            // it must never be routed into an existing (possibly dead) connection for its address.
+            let Frame::Hello { key } = frame else {
+                self.route_to_existing(from, frame);
                 continue;
-            }
+            };
 
-            // A new peer: only a Hello opens a connection.
-            if let Frame::Hello { key } = frame {
-                let (tx, rx) = mpsc::unbounded_channel();
-                self.routes.lock().unwrap().insert(from, tx);
-                let ack = Frame::HelloAck { key: self.our_key };
-                let _ = self.socket.send_to(&ack.to_bytes(), from).await;
-                let _ = self
-                    .accept_tx
-                    .send(Connection::new(self.socket.clone(), from, key, rx));
+            // A Hello opens (or replaces) the connection for this address.
+            let (tx, rx) = mpsc::channel(INBOUND_CAPACITY);
+            let generation = self.generations.fetch_add(1, Ordering::Relaxed);
+            self.routes.lock().expect("routes never poisoned").insert(
+                from,
+                Route {
+                    generation,
+                    inbound: tx,
+                },
+            );
+            let ack = Frame::HelloAck { key: self.our_key };
+            let _ = self.socket.send_to(&ack.to_bytes(), from).await;
+            let connection = Connection::new(
+                Arc::clone(&self.socket),
+                Arc::clone(&self.routes),
+                generation,
+                from,
+                key,
+                rx,
+            );
+            // The accept queue is full or the endpoint is gone: shed this connection. Dropping it
+            // prunes its own route, so a later retry from the same address can still succeed.
+            let _ = self.accept_tx.try_send(connection);
+        }
+    }
+
+    /// Deliver a non-`Hello` frame to the live route for `from`, pruning a route whose connection has
+    /// been dropped so it cannot keep absorbing (and black-holing) frames.
+    fn route_to_existing(&self, from: SocketAddr, frame: Frame) {
+        let existing = self
+            .routes
+            .lock()
+            .expect("routes never poisoned")
+            .get(&from)
+            .map(|route| mpsc::Sender::clone(&route.inbound));
+        let Some(inbound) = existing else {
+            return;
+        };
+        match inbound.try_send(frame) {
+            // Delivered, or shed under flood: handled for a live route either way.
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+            // The receiver is gone: prune the dead route so it stops absorbing frames.
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.routes
+                    .lock()
+                    .expect("routes never poisoned")
+                    .remove(&from);
             }
         }
     }
@@ -183,48 +309,67 @@ impl Driver {
 /// [`recv_datagram`](Connection::recv_datagram), stream data to the read half, and acks to the write
 /// half. The identity is nominal in phase 0; Noise makes it real in phase 1.
 pub struct Connection {
-    socket: Arc<UdpSocket>,
+    socket: Arc<Socket>,
+    routes: Routes,
+    /// The generation that installed this connection's route, so `Drop` prunes only its own entry and
+    /// never a newer connection's route for the same reused address.
+    generation: u64,
     peer_addr: SocketAddr,
     peer_key: [u8; wire::KEY_LEN],
-    datagrams: mpsc::UnboundedReceiver<Bytes>,
+    datagrams: mpsc::Receiver<Bytes>,
     stream: Mutex<Option<(SendStream, RecvStream)>>,
+    /// Turns `true` once the receive engine has delivered every stream byte and seen the peer's FIN,
+    /// so [`wait_closed`](Connection::wait_closed) resolves only after inbound data has drained.
+    closed: tokio::sync::watch::Receiver<bool>,
+    /// Turns `true` once the send engine has delivered every written byte and its FIN has been acked,
+    /// so [`wait_closed`](Connection::wait_closed) also waits for our outbound data to reach the peer
+    /// before the caller may drop the connection (which would otherwise sever in-flight retransmits).
+    drained: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Connection {
     fn new(
-        socket: Arc<UdpSocket>,
+        socket: Arc<Socket>,
+        routes: Routes,
+        generation: u64,
         peer_addr: SocketAddr,
         peer_key: [u8; wire::KEY_LEN],
-        inbound: mpsc::UnboundedReceiver<Frame>,
+        inbound: mpsc::Receiver<Frame>,
     ) -> Self {
-        let (datagram_tx, datagram_rx) = mpsc::unbounded_channel();
+        let (datagram_tx, datagram_rx) = mpsc::channel(DATAGRAM_CAPACITY);
         let (recv_engine, recv_user) = tokio::io::duplex(DUPLEX_BUF);
         let (send_user, send_engine) = tokio::io::duplex(DUPLEX_BUF);
-        let (ack_tx, ack_rx) = mpsc::unbounded_channel();
+        let (ack_tx, ack_rx) = mpsc::channel(ACK_CAPACITY);
+        let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
+        let (drained_tx, drained_rx) = tokio::sync::watch::channel(false);
 
         tokio::spawn(
             Dispatcher {
                 inbound,
-                socket: socket.clone(),
+                socket: Arc::clone(&socket),
                 peer_addr,
                 datagram_tx,
                 recv: recv_engine,
                 ack_tx,
+                closed: closed_tx,
             }
             .run(),
         );
         tokio::spawn(
             Sender {
-                socket: socket.clone(),
+                socket: Arc::clone(&socket),
                 peer_addr,
                 send: send_engine,
                 ack_rx,
+                drained: drained_tx,
             }
             .run(),
         );
 
         Self {
             socket,
+            routes,
+            generation,
             peer_addr,
             peer_key,
             datagrams: datagram_rx,
@@ -232,6 +377,8 @@ impl Connection {
                 SendStream { inner: send_user },
                 RecvStream { inner: recv_user },
             ))),
+            closed: closed_rx,
+            drained: drained_rx,
         }
     }
 
@@ -264,7 +411,11 @@ impl Connection {
 
     /// Take the connection's bidirectional stream: a write half and a read half. Available once.
     pub fn open_bi(&self) -> Result<(SendStream, RecvStream), Error> {
-        self.stream.lock().unwrap().take().ok_or(Error::Closed)
+        self.stream
+            .lock()
+            .expect("stream mutex never poisoned")
+            .take()
+            .ok_or(Error::Closed)
     }
 
     /// The single stream is symmetric, so accepting it is the same as opening it.
@@ -272,9 +423,33 @@ impl Connection {
         self.open_bi()
     }
 
-    /// Wait for the connection to finish. Phase 0: the send/recv engines are detached tasks that drain
-    /// buffered data independently and the peer's read gates delivery, so this is currently a no-op.
-    pub async fn wait_closed(&self) {}
+    /// Wait until both directions have quiesced: the peer has finished sending (its FIN seen and all
+    /// inbound bytes delivered) and our own writes have been delivered and acked. Only then is it safe
+    /// to drop the connection, which prunes its route and severs the engines; returning on the inbound
+    /// FIN alone would let a caller drop mid-retransmit and truncate outbound data still in flight.
+    pub async fn wait_closed(&self) {
+        Self::wait_true(self.closed.clone()).await;
+        Self::wait_true(self.drained.clone()).await;
+    }
+
+    /// Await a watch flag becoming `true`, resolving early if its sender is dropped (the engine exited,
+    /// so no further progress is possible and blocking would hang forever).
+    async fn wait_true(mut flag: tokio::sync::watch::Receiver<bool>) {
+        while !*flag.borrow() {
+            if flag.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+impl Drop for Connection {
+    /// Prune this connection's peer-address route so a dead connection cannot black-hole a peer that
+    /// later dials from the same address, and so the routing table does not grow without bound. Removes
+    /// only its own entry (matched by generation), never a newer connection's route for a reused address.
+    fn drop(&mut self) {
+        prune_route(&self.routes, self.peer_addr, self.generation);
+    }
 }
 
 /// The writable half of a quirk stream. Bytes written are chunked and reliably delivered by the
@@ -319,39 +494,82 @@ impl AsyncRead for RecvStream {
 /// The connection's receive engine: routes each inbound frame to the datagram queue, the stream's read
 /// half (reassembling and acking), or the send engine (acks of our writes).
 struct Dispatcher {
-    inbound: mpsc::UnboundedReceiver<Frame>,
-    socket: Arc<UdpSocket>,
+    inbound: mpsc::Receiver<Frame>,
+    socket: Arc<Socket>,
     peer_addr: SocketAddr,
-    datagram_tx: mpsc::UnboundedSender<Bytes>,
+    datagram_tx: mpsc::Sender<Bytes>,
     recv: DuplexStream,
-    ack_tx: mpsc::UnboundedSender<u32>,
+    ack_tx: mpsc::Sender<u32>,
+    closed: tokio::sync::watch::Sender<bool>,
 }
 
 impl Dispatcher {
     async fn run(mut self) {
         let mut reassembler = StreamRx::new();
+        // The FIN's sequence, once seen. The read half is only shut down once reassembly has caught up
+        // to it, so a reordered or retransmitted final data segment arriving after the FIN cannot be
+        // delivered as a truncated clean EOF.
+        let mut fin_seq: Option<u32> = None;
+        // Whether the read half has been closed. The engine keeps running past this to route the peer's
+        // acks of our own writes (the reverse direction outlives our read half), so it must not exit
+        // when the stream terminates, only stop delivering and re-acking data.
+        let mut read_closed = false;
         while let Some(frame) = self.inbound.recv().await {
             match frame {
                 Frame::Datagram { data } => {
-                    let _ = self.datagram_tx.send(data);
+                    // Unreliable: shed rather than block or grow memory when the application lags.
+                    let _ = self.datagram_tx.try_send(data);
                 }
-                Frame::Data { seq, bytes, .. } => {
+                Frame::Data { seq, bytes, .. } if !read_closed => {
                     let delivered = reassembler.accept(seq, bytes);
                     if !delivered.is_empty() {
                         let _ = self.recv.write_all(&delivered).await;
                     }
-                    self.send_ack(reassembler.ack()).await;
+                    if !self.terminate_if_complete(reassembler.ack(), fin_seq).await {
+                        self.send_ack(reassembler.ack()).await;
+                    } else {
+                        read_closed = true;
+                    }
                 }
-                Frame::Fin { .. } => {
-                    self.send_ack(reassembler.ack()).await;
-                    let _ = self.recv.shutdown().await;
+                Frame::Fin { seq, .. } if !read_closed => {
+                    fin_seq = Some(seq);
+                    if self.terminate_if_complete(reassembler.ack(), fin_seq).await {
+                        read_closed = true;
+                    } else {
+                        // Data is still missing; ack progress so the sender retransmits the gap.
+                        self.send_ack(reassembler.ack()).await;
+                    }
+                }
+                // A retransmitted FIN or trailing data after clean EOF: re-ack past the FIN so a peer
+                // that lost our terminating ack stops retransmitting, then ignore.
+                Frame::Data { .. } | Frame::Fin { .. } => {
+                    if let Some(fin_seq) = fin_seq {
+                        self.send_ack(fin_seq + 1).await;
+                    }
                 }
                 Frame::Ack { seq, .. } => {
-                    let _ = self.ack_tx.send(seq);
+                    let _ = self.ack_tx.try_send(seq);
                 }
                 _ => {}
             }
         }
+    }
+
+    /// If the FIN has been seen and reassembly has reached it, all data is delivered: shut the read
+    /// half for a clean EOF, ack past the FIN so the sender stops retransmitting, and signal closed.
+    /// Returns whether the stream terminated.
+    async fn terminate_if_complete(&mut self, ack: u32, fin_seq: Option<u32>) -> bool {
+        let Some(fin_seq) = fin_seq else {
+            return false;
+        };
+        if ack < fin_seq {
+            return false;
+        }
+        let _ = self.recv.shutdown().await;
+        // Ack one past the FIN so the sender's stop-and-wait loop sees the terminator acknowledged.
+        self.send_ack(fin_seq + 1).await;
+        let _ = self.closed.send(true);
+        true
     }
 
     async fn send_ack(&self, seq: u32) {
@@ -361,12 +579,16 @@ impl Dispatcher {
 }
 
 /// The connection's send engine: reads the user's writes, chunks them, delivers each reliably with
-/// stop-and-wait retransmission, then finishes the stream when the user closes the write half.
+/// stop-and-wait retransmission, then finishes the stream by delivering a FIN reliably too, so a lost
+/// terminator is retransmitted rather than hanging the peer's reader forever.
 struct Sender {
-    socket: Arc<UdpSocket>,
+    socket: Arc<Socket>,
     peer_addr: SocketAddr,
     send: DuplexStream,
-    ack_rx: mpsc::UnboundedReceiver<u32>,
+    ack_rx: mpsc::Receiver<u32>,
+    /// Set to `true` once every written byte and the FIN have been acked, so
+    /// [`Connection::wait_closed`] can guarantee outbound delivery before the connection is dropped.
+    drained: tokio::sync::watch::Sender<bool>,
 }
 
 impl Sender {
@@ -382,27 +604,37 @@ impl Sender {
                 stream: 0,
                 seq,
                 bytes: Bytes::copy_from_slice(&buf[..read]),
-            }
-            .to_bytes();
-            loop {
-                let _ = self.socket.send_to(&frame, self.peer_addr).await;
-                let acked = loop {
-                    match tokio::time::timeout(RETRANSMIT, self.ack_rx.recv()).await {
-                        Ok(Some(ack)) if ack > seq => break true,
-                        Ok(Some(_)) => continue, // stale ack; keep waiting
-                        Ok(None) => return,      // channel closed; dispatcher gone
-                        Err(_) => break false,   // timed out; retransmit
-                    }
-                };
-                if acked {
-                    break;
-                }
+            };
+            if self.deliver(seq, &frame.to_bytes()).await.is_break() {
+                return;
             }
             seq += 1;
         }
-        let fin = Frame::Fin { stream: 0 }.to_bytes();
-        for _ in 0..3 {
-            let _ = self.socket.send_to(&fin, self.peer_addr).await;
+        // Every data byte is acked, so all outbound content has reached the peer: wait_closed may now
+        // let the connection drop. The FIN below is retransmitted only so a peer reading to EOF sees a
+        // clean end; delivery of the payload itself no longer depends on that terminator being acked,
+        // and a peer that read a known length has already moved on.
+        let _ = self.drained.send(true);
+        // The FIN occupies the sequence one past the last data segment and is delivered reliably under
+        // the same stop-and-wait loop, so a lossy link cannot lose the stream terminator.
+        let fin = Frame::Fin { stream: 0, seq };
+        let _ = self.deliver(seq, &fin.to_bytes()).await;
+    }
+
+    /// Send one frame occupying sequence `seq` and retransmit it on timeout until the peer's cumulative
+    /// ack passes it. Breaks (stops the engine) if the ack channel closes, meaning the dispatcher is
+    /// gone and no ack can ever arrive.
+    async fn deliver(&mut self, seq: u32, frame: &[u8]) -> core::ops::ControlFlow<()> {
+        loop {
+            let _ = self.socket.send_to(frame, self.peer_addr).await;
+            loop {
+                match tokio::time::timeout(RETRANSMIT, self.ack_rx.recv()).await {
+                    Ok(Some(ack)) if ack > seq => return core::ops::ControlFlow::Continue(()),
+                    Ok(Some(_)) => continue, // stale ack; keep waiting
+                    Ok(None) => return core::ops::ControlFlow::Break(()), // dispatcher gone
+                    Err(_) => break,         // timed out; retransmit
+                }
+            }
         }
     }
 }

@@ -52,10 +52,14 @@ pub enum Frame {
         /// The next sequence number the receiver still needs.
         seq: u32,
     },
-    /// The sender has finished writing to `stream`.
+    /// The sender has finished writing to `stream`. Carries the sequence number the terminator
+    /// occupies (one past the last data segment), so the receiver only signals end-of-stream once
+    /// reassembly has reached it and a reordered final segment cannot be delivered as a truncated EOF.
     Fin {
         /// The finished stream.
         stream: u32,
+        /// The sequence number the FIN occupies: one past the sender's last data segment.
+        seq: u32,
     },
 }
 
@@ -87,9 +91,10 @@ impl Frame {
                 buf.extend_from_slice(&stream.to_be_bytes());
                 buf.extend_from_slice(&seq.to_be_bytes());
             }
-            Frame::Fin { stream } => {
+            Frame::Fin { stream, seq } => {
                 buf.push(T_FIN);
                 buf.extend_from_slice(&stream.to_be_bytes());
+                buf.extend_from_slice(&seq.to_be_bytes());
             }
         }
     }
@@ -132,8 +137,9 @@ impl Frame {
             }
             T_FIN => {
                 let (stream, rest) = read_u32(body)?;
+                let (seq, rest) = read_u32(rest)?;
                 expect_empty(rest)?;
-                Ok(Frame::Fin { stream })
+                Ok(Frame::Fin { stream, seq })
             }
             other => Err(DecodeError::UnknownType(other)),
         }
@@ -223,7 +229,7 @@ mod tests {
 
     #[test]
     fn fin_roundtrips() {
-        roundtrips(Frame::Fin { stream: 3 });
+        roundtrips(Frame::Fin { stream: 3, seq: 17 });
     }
 
     #[test]
