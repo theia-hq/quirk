@@ -14,3 +14,13 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+wildcard_imports = "deny"
+std_instead_of_core = "warn"
+alloc_instead_of_core = "warn"
+
+[lints.rust]
+unused_must_use = "deny"

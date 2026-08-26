@@ -25,14 +25,14 @@ mod stream_tests;
 #[cfg(test)]
 mod wire_tests;
 
+use core::net::{Ipv4Addr, SocketAddr};
+use core::pin::Pin;
+use core::sync::atomic::{AtomicU64, Ordering};
+use core::task::{Context, Poll};
+use core::time::Duration;
 use std::collections::HashMap;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
-use std::time::Duration;
 
 use bytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -94,6 +94,9 @@ struct Route {
 /// Remove `peer`'s route only if it is still the one installed at `generation`. A newer route for the
 /// same address (a peer that redialed before an old connection's drop ran) is left in place.
 fn prune_route(routes: &Routes, peer: SocketAddr, generation: u64) {
+    // The routes lock guards only map insert/remove/get; none of those can panic, so the lock is never
+    // poisoned and this expect is unreachable.
+    #[allow(clippy::expect_used)]
     let mut routes = routes.lock().expect("routes never poisoned");
     if routes
         .get(&peer)
@@ -171,6 +174,9 @@ impl Endpoint {
     pub async fn connect(&self, peer: SocketAddr) -> Result<Connection, Error> {
         let (tx, mut rx) = mpsc::channel(INBOUND_CAPACITY);
         let generation = self.generations.fetch_add(1, Ordering::Relaxed);
+        // The routes lock guards only an infallible map insert, so it is never poisoned; the expect is
+        // unreachable.
+        #[allow(clippy::expect_used)]
         self.routes.lock().expect("routes never poisoned").insert(
             peer,
             Route {
@@ -260,6 +266,9 @@ impl Driver {
             // A Hello opens (or replaces) the connection for this address.
             let (tx, rx) = mpsc::channel(INBOUND_CAPACITY);
             let generation = self.generations.fetch_add(1, Ordering::Relaxed);
+            // The routes lock guards only an infallible map insert, so it is never poisoned; the expect
+            // is unreachable.
+            #[allow(clippy::expect_used)]
             self.routes.lock().expect("routes never poisoned").insert(
                 from,
                 Route {
@@ -286,6 +295,9 @@ impl Driver {
     /// Deliver a non-`Hello` frame to the live route for `from`, pruning a route whose connection has
     /// been dropped so it cannot keep absorbing (and black-holing) frames.
     fn route_to_existing(&self, from: SocketAddr, frame: Frame) {
+        // The routes lock guards only an infallible map lookup, so it is never poisoned; the expect is
+        // unreachable.
+        #[allow(clippy::expect_used)]
         let existing = self
             .routes
             .lock()
@@ -300,6 +312,9 @@ impl Driver {
             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
             // The receiver is gone: prune the dead route so it stops absorbing frames.
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                // The routes lock guards only an infallible map removal, so it is never poisoned; the
+                // expect is unreachable.
+                #[allow(clippy::expect_used)]
                 self.routes
                     .lock()
                     .expect("routes never poisoned")
@@ -416,6 +431,9 @@ impl Connection {
 
     /// Take the connection's bidirectional stream: a write half and a read half. Available once.
     pub fn open_bi(&self) -> Result<(SendStream, RecvStream), Error> {
+        // The stream lock guards only an infallible `Option::take`, so it is never poisoned; the expect
+        // is unreachable.
+        #[allow(clippy::expect_used)]
         self.stream
             .lock()
             .expect("stream mutex never poisoned")
@@ -433,8 +451,15 @@ impl Connection {
     /// to drop the connection, which prunes its route and severs the engines; returning on the inbound
     /// FIN alone would let a caller drop mid-retransmit and truncate outbound data still in flight.
     pub async fn wait_closed(&self) {
-        Self::wait_true(self.closed.clone()).await;
-        Self::wait_true(self.drained.clone()).await;
+        // `drained` is signalled by the send engine once every data byte is acked but *before* the FIN
+        // is delivered (see `Sender::run`), so returning here only guarantees the peer received the
+        // payload, not that it saw the terminator. The FIN's final retransmits ride on the detached,
+        // spawned `Sender` task, which outlives this `Connection`: a future change that joined or aborted
+        // those engines on drop would sever those retransmits and silently truncate the peer's clean EOF.
+        let closed = tokio::sync::watch::Receiver::clone(&self.closed);
+        let drained = tokio::sync::watch::Receiver::clone(&self.drained);
+        Self::wait_true(closed).await;
+        Self::wait_true(drained).await;
     }
 
     /// Await a watch flag becoming `true`, resolving early if its sender is dropped (the engine exited,
@@ -618,7 +643,10 @@ impl Sender {
         // Every data byte is acked, so all outbound content has reached the peer: wait_closed may now
         // let the connection drop. The FIN below is retransmitted only so a peer reading to EOF sees a
         // clean end; delivery of the payload itself no longer depends on that terminator being acked,
-        // and a peer that read a known length has already moved on.
+        // and a peer that read a known length has already moved on. Signalling `drained` here (before
+        // the FIN) is only safe because this engine is a detached, spawned task that keeps retransmitting
+        // the FIN after `Connection` drops; a future change that joined or aborted it on drop would cut
+        // those retransmits and truncate the peer's clean EOF (see `Connection::wait_closed`).
         let _ = self.drained.send(true);
         // The FIN occupies the sequence one past the last data segment and is delivered reliably under
         // the same stop-and-wait loop, so a lossy link cannot lose the stream terminator.

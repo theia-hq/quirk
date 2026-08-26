@@ -7,13 +7,15 @@
 //! endpoint's outbound datagram sequence is exactly `Hello, data 0, data 1, ..., FIN` (or, on the
 //! acceptor, `HelloAck, ack, ...`) and each dropped index targets a known frame.
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::time::Duration;
+use core::net::{Ipv4Addr, SocketAddr};
+use core::time::Duration;
 
 use quirk::Endpoint;
 use quirk::socket::Faults;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+// A test helper, not a `#[test]` fn, so `allow-*-in-tests` does not reach the unwrap inside it.
+#[allow(clippy::unwrap_used)]
 fn loopback(endpoint: &Endpoint) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, endpoint.local_addr().unwrap().port()))
 }
@@ -22,6 +24,8 @@ fn loopback(endpoint: &Endpoint) -> SocketAddr {
 /// return the bytes the acceptor reads to a clean end. Both idle stream halves are held open so the
 /// only datagrams the dialer sends are its own stream's, keeping the fault schedule predictable: send
 /// #1 is the Hello, #2 the first data frame, one per chunk after, and the FIN last.
+// A test helper, not a `#[test]` fn, so `allow-*-in-tests` does not reach the unwrap/expect inside it.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn one_way_over(dialer_faults: Faults, payload: Vec<u8>) -> Vec<u8> {
     let acceptor = Endpoint::bind().await.unwrap();
     let dialer = Endpoint::bind_lossy(dialer_faults).await.unwrap();
@@ -96,6 +100,8 @@ async fn suppresses_a_retransmitted_duplicate() {
 
 /// Run a one-way transfer where the acceptor drops its first outbound ack, forcing the sender to
 /// retransmit the acked data frame so the receiver observes a duplicate. Returns the acceptor's bytes.
+// A test helper, not a `#[test]` fn, so `allow-*-in-tests` does not reach the unwrap/expect inside it.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn duplicate_via_dropped_ack(payload: Vec<u8>) -> Vec<u8> {
     // The acceptor's outbound datagrams are: #1 HelloAck, #2 the ack of data seq 0. Drop #2 so the
     // sender never learns data seq 0 landed and retransmits it.

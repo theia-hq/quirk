@@ -1,8 +1,10 @@
+use core::net::{Ipv4Addr, SocketAddr};
 use std::collections::HashSet;
-use std::net::{Ipv4Addr, SocketAddr};
 
 use quirk::Endpoint;
 
+// A test helper, not a `#[test]` fn, so `allow-*-in-tests` does not reach the unwrap inside it.
+#[allow(clippy::unwrap_used)]
 fn loopback(endpoint: &Endpoint) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, endpoint.local_addr().unwrap().port()))
 }

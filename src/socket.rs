@@ -7,8 +7,8 @@
 //! UDP layer (maggie: reflexive-address discovery, hole-punching, relay upgrade) will one day drop in
 //! without touching the reliability engine.
 
+use core::net::SocketAddr;
 use std::io;
-use std::net::SocketAddr;
 use std::sync::Mutex;
 
 use tokio::net::UdpSocket;
@@ -99,6 +99,9 @@ impl Faulty {
 
     async fn send_to(&self, bytes: &[u8], peer: SocketAddr) -> io::Result<usize> {
         let count = {
+            // The counter lock guards only an infallible increment, so it is never poisoned; the expect
+            // is unreachable.
+            #[allow(clippy::expect_used)]
             let mut sends = self.sends.lock().expect("send counter never poisoned");
             *sends += 1;
             *sends

@@ -152,6 +152,9 @@ fn key_from(body: &[u8]) -> Result<[u8; KEY_LEN], DecodeError> {
 
 fn read_u32(body: &[u8]) -> Result<(u32, &[u8]), DecodeError> {
     let (head, rest) = body.split_at_checked(4).ok_or(DecodeError::Truncated)?;
+    // `split_at_checked(4)` returned `Some`, so `head` is exactly four bytes and the array conversion
+    // is infallible; the expect can only fire if that guarantee is ever broken above.
+    #[allow(clippy::expect_used)]
     let value = u32::from_be_bytes(head.try_into().expect("split_at_checked yields four bytes"));
     Ok((value, rest))
 }
