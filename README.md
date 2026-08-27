@@ -1,15 +1,14 @@
 # quirk
 
-Our own QUIC, built from scratch over UDP to learn how the transport machinery (framing, handshake,
-streams, reliability) actually works, rather than reach for an existing stack. The name is a play on
-"QUIC".
+A QUIC-style transport over UDP, written from scratch: connections, reliable in-order streams, and
+unreliable datagrams, with the framing, handshake, and retransmission implemented by hand rather than
+taken from a library. It is a learning implementation, built to understand how a modern transport works
+by building one, and it is not interoperable with standard QUIC.
 
-quirk is also a real `bifrost` transport, not just a toy: an out-of-tree `bifrost-quirk` adapter makes
-it pass the same `reach` conformance suite as iroh and the in-memory transport. The same app, dialing
-the same identity, runs unchanged over our own QUIC.
+It also works as a real transport backend: an adapter makes quirk pass the same connection test suite as
+iroh and the in-memory backend, so an application dialing a given identity runs unchanged over it.
 
-> Experimental and incomplete. A learning implementation: not production-ready, and not interoperable
-> with standard QUIC.
+> Experimental and incomplete. Not production-ready, and not wire-compatible with standard QUIC.
 
 ## What's implemented
 
