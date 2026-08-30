@@ -8,6 +8,10 @@ by building one, and it is not interoperable with standard QUIC.
 It also works as a real transport backend: an adapter makes quirk pass the same connection test suite as
 iroh and the in-memory backend, so an application dialing a given identity runs unchanged over it.
 
+**The name.** quirk is QUIC built by hand: the framing, handshake, and retransmission a library
+would hide, written out so you can read them. The name plays on QUIC, with the quirk of a
+from-scratch build that goes its own way and does not speak to standard QUIC.
+
 > Experimental and incomplete. Not production-ready, and not wire-compatible with standard QUIC.
 
 ## What's implemented
