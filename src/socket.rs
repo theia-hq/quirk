@@ -1,8 +1,8 @@
-//! The datagram socket seam.
+//! The datagram socket boundary.
 //!
 //! quirk drives its reliability layer over a single UDP socket. Real networks drop datagrams; loopback
 //! never does, which is precisely why the reliability layer needs a fault-injecting socket to be tested
-//! honestly. [`Socket`] is that seam: a plain [`UdpSocket`] in production, or a fault-injecting wrapper
+//! honestly. [`Socket`] is that boundary: a plain [`UdpSocket`] in production, or a fault-injecting wrapper
 //! in tests, chosen at bind time and invisible above the socket boundary. It is also where a smarter
 //! UDP layer (maggie: reflexive-address discovery, hole-punching, relay upgrade) will one day drop in
 //! without touching the reliability engine.
