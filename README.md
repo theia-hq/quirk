@@ -14,6 +14,8 @@ from-scratch build that goes its own way and does not speak to standard QUIC.
 
 > Experimental and incomplete. Not production-ready, and not wire-compatible with standard QUIC.
 
+This page describes the default branch.
+
 ## What's implemented
 
 - **Wire codec.** Magic-prefixed frames (`Hello`, `HelloAck`, `Datagram`, `Data`, `Ack`, `Fin`); pure
