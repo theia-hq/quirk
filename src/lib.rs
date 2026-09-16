@@ -1,4 +1,4 @@
-//! quirk: our own QUIC over UDP.
+//! quirk: a QUIC-shaped transport over UDP, written from scratch.
 //!
 //! A from-scratch, QUIC-shaped transport implemented to learn networking internals rather than wrap
 //! an existing stack (it is not built on quinn). quirk is standalone and knows nothing about bifrost;

@@ -1,6 +1,7 @@
 [package]
 publish = false  # git-only for now, not published to crates.io
 name = "quirk"
+description = "A QUIC-shaped transport written from scratch over UDP, to learn the layer. Not QUIC."
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
