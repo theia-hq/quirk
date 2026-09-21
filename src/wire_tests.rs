@@ -1,6 +1,10 @@
 use bytes::Bytes;
 
-use crate::wire::{DecodeError, Frame, KEY_LEN, MAGIC};
+use crate::wire::{DecodeError, Frame, KEY_LEN};
+
+/// The four magic bytes a well-formed datagram opens with, spelled out rather than imported, so a
+/// test cannot agree with the codec by sharing its constant.
+const MAGIC: [u8; 4] = *b"QRK0";
 
 fn roundtrips(frame: Frame) {
     assert_eq!(Frame::decode(&frame.to_bytes()), Ok(frame));
@@ -52,11 +56,42 @@ fn fin_roundtrips() {
     roundtrips(Frame::Fin { stream: 3, seq: 17 });
 }
 
-#[test]
-fn rejects_bad_magic() {
+/// One well-formed `Hello` datagram with the byte at `at` replaced. The two tests below differ only
+/// in WHICH half of the magic they corrupt, because that single difference is the whole claim.
+fn datagram_with(at: usize, byte: u8) -> Vec<u8> {
     let mut bytes = Frame::Hello { key: [0; KEY_LEN] }.to_bytes();
-    bytes[0] = b'X';
-    assert_eq!(Frame::decode(&bytes), Err(DecodeError::BadMagic));
+    bytes[at] = byte;
+    bytes
+}
+
+/// A datagram whose IDENTITY is not ours is not a quirk datagram, and that is all it is.
+#[test]
+fn rejects_a_foreign_identity() {
+    // `XRK0`: one byte of the identity changed, and nothing else.
+    assert_eq!(
+        Frame::decode(&datagram_with(0, b'X')),
+        Err(DecodeError::Foreign)
+    );
+}
+
+/// The version half of the magic is PARSED, so a quirk peer on another build is a distinguishable
+/// condition rather than a foreign datagram. Revert the parse to a four-byte comparison and this goes
+/// red at the first assertion. It stays a DROP either way (`tests/silence.rs` holds that); what this
+/// pins is that the receiver knows which of the two it dropped.
+#[test]
+fn a_version_mismatch_is_not_a_foreign_datagram() {
+    // `QRK1`: one byte of the version changed, and nothing else.
+    let error = Frame::decode(&datagram_with(3, b'1')).expect_err("QRK1 is not this grammar");
+
+    assert_ne!(
+        error,
+        DecodeError::Foreign,
+        "a quirk peer on another build is not a foreign protocol"
+    );
+    assert_eq!(
+        error.to_string(),
+        "quirk wire version mismatch: the datagram is QRK1, this build speaks QRK0"
+    );
 }
 
 #[test]

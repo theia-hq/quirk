@@ -5,8 +5,72 @@
 
 use bytes::Bytes;
 
-/// Magic prefixing every quirk datagram. Stray or foreign packets are rejected on decode.
-pub const MAGIC: [u8; 4] = *b"QRK0";
+/// quirk's protocol identity: the bytes every datagram opens with, at every version, forever. A
+/// datagram that does not open with these is not a quirk datagram, and that is the only thing an
+/// identity mismatch is allowed to mean.
+const IDENTITY: [u8; 3] = *b"QRK";
+
+/// The packet grammar THIS build speaks, written after [`IDENTITY`] and parsed (never compared whole)
+/// on read: together they are the four magic bytes `QRK0`.
+const VERSION: WireVersion = WireVersion(*b"0");
+
+/// The magic splits by RULE, not by a remembered offset: the identity is the leading run of capitals,
+/// the version is the digits after it, four bytes in all. Held at build time so a magic that breaks the
+/// rule fails to compile rather than splitting somewhere the next reader would not look. A digit is
+/// never a capital, so "all capitals, then all digits" is exactly "the maximal leading capital run".
+const _: () = assert!(
+    all_between(&IDENTITY, b'A', b'Z')
+        && all_between(VERSION.as_bytes(), b'0', b'9')
+        && IDENTITY.len() + VERSION.as_bytes().len() == 4,
+    "the magic must be four bytes: a run of capitals (the identity) then digits (the version)"
+);
+
+/// Whether `bytes` is non-empty and every byte falls in `lo..=hi`. `const` because its one caller is a
+/// build-time claim about the magic.
+const fn all_between(bytes: &[u8], lo: u8, hi: u8) -> bool {
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] < lo || bytes[at] > hi {
+            return false;
+        }
+        at += 1;
+    }
+    !bytes.is_empty()
+}
+
+/// The version half of a datagram's magic: the byte after [`IDENTITY`], naming which packet grammar
+/// the peer that wrote it speaks.
+///
+/// Parsed as a value rather than folded into one four-byte comparison, because the two halves of the
+/// magic answer different questions: "not our protocol" and "our protocol, another build" are two
+/// facts, and a receiver that throws the distinction away cannot tell an operator which one it saw.
+/// Both are DROPPED here, for the reason on [`DecodeError`], but they are dropped as distinct
+/// conditions rather than as one undifferentiated failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireVersion([u8; 1]);
+
+impl WireVersion {
+    /// Split the version half off the front of `after_identity`. The width of the field lives here, in
+    /// the type that owns it, so the reader and the writer cannot drift apart.
+    fn split(after_identity: &[u8]) -> Option<(Self, &[u8])> {
+        let (bytes, rest) = after_identity.split_at_checked(1)?;
+        Some((Self([bytes[0]]), rest))
+    }
+
+    /// The bytes as they go on the wire.
+    const fn as_bytes(&self) -> &[u8; 1] {
+        &self.0
+    }
+}
+
+impl core::fmt::Display for WireVersion {
+    /// Renders the WHOLE four-byte tag (`QRK0`), because that is the form the source and the changelog
+    /// use, so anyone holding one from a log line can match it against what they read. A peer's version
+    /// byte is arbitrary and need not be printable, so it is escaped rather than trusted.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}{}", IDENTITY.escape_ascii(), self.0.escape_ascii())
+    }
+}
 
 /// The length of a raw ed25519 public key.
 pub const KEY_LEN: usize = 32;
@@ -66,7 +130,8 @@ pub enum Frame {
 impl Frame {
     /// Append the framed byte encoding to `buf`.
     pub fn encode(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&MAGIC);
+        buf.extend_from_slice(&IDENTITY);
+        buf.extend_from_slice(VERSION.as_bytes());
         match self {
             Frame::Hello { key } => {
                 buf.push(T_HELLO);
@@ -107,8 +172,17 @@ impl Frame {
     }
 
     /// Decode one frame from a datagram.
+    ///
+    /// The magic is parsed as [`IDENTITY`] plus a [`WireVersion`], never compared as four bytes, so
+    /// that "not our protocol" and "our protocol, another build" stay two facts instead of one.
+    /// Neither is answered: see [`DecodeError`] for why this wire, alone in its family, must stay
+    /// silent about both.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        let rest = bytes.strip_prefix(&MAGIC).ok_or(DecodeError::BadMagic)?;
+        let rest = bytes.strip_prefix(&IDENTITY).ok_or(DecodeError::Foreign)?;
+        let (version, rest) = WireVersion::split(rest).ok_or(DecodeError::Truncated)?;
+        if version != VERSION {
+            return Err(DecodeError::Version { peer: version });
+        }
         let (&ty, body) = rest.split_first().ok_or(DecodeError::Truncated)?;
         match ty {
             T_HELLO => Ok(Frame::Hello {
@@ -168,11 +242,33 @@ fn expect_empty(rest: &[u8]) -> Result<(), DecodeError> {
 }
 
 /// Why a datagram could not be decoded into a [`Frame`].
+///
+/// **Every variant is dropped in silence, and a version mismatch MUST stay that way.** Every other
+/// wire in this family answers a peer whose identity it recognised at a version it does not serve,
+/// because there silence sends an operator hunting a broken network instead of a version skew. This
+/// wire is the exception, and the exception is a security property, not an omission: these bytes
+/// arrive in an unauthenticated UDP datagram whose source address is a CLAIM, so any reply is a
+/// packet an attacker can aim at a third party by writing that party's address into the `from` field.
+/// A responder that answers unsolicited datagrams is a reflection amplifier and an unauthenticated
+/// scan target, and that outweighs the diagnostic every time.
+///
+/// So this type deliberately carries no `answer` constructor, unlike its siblings on the stream
+/// wires. When quirk needs version negotiation it takes the QUIC mechanism (a Version Negotiation
+/// packet under its own anti-amplification limits), which is designed for a spoofable source; it does
+/// not take the stream-preamble convention. Do not "fix" the silence for uniformity.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DecodeError {
-    /// The datagram did not begin with the quirk magic.
-    #[error("bad magic")]
-    BadMagic,
+    /// The datagram did not begin with [`IDENTITY`], so it is not a quirk datagram. On a shared UDP
+    /// port this is the ordinary case: stray scans and other protocols land here.
+    #[error("not a quirk datagram")]
+    Foreign,
+    /// A quirk datagram from a build that speaks a different packet grammar. Distinguishable from a
+    /// foreign datagram so a log line can say which was seen; never answered, per this type's doc.
+    #[error("quirk wire version mismatch: the datagram is {peer}, this build speaks {VERSION}")]
+    Version {
+        /// The version the peer's datagram named.
+        peer: WireVersion,
+    },
     /// The datagram ended before a full frame was read, or carried trailing bytes.
     #[error("truncated frame")]
     Truncated,
