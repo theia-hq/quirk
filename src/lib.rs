@@ -272,6 +272,11 @@ impl Driver {
                 Ok(datagram) => datagram,
                 Err(_) => break,
             };
+            // Silence is the ONLY answer an undecodable datagram may get, including one whose magic
+            // says "quirk, another version". `from` is an unverified claim at this point, so writing
+            // anything back turns this endpoint into a reflector an attacker aims by forging a source
+            // address, and into a responder that confirms itself to a scanner. Dropping costs a peer
+            // on a skewed build its diagnostic; answering costs a stranger their bandwidth.
             let Ok(frame) = Frame::decode(&buf[..len]) else {
                 continue;
             };
