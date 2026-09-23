@@ -2,6 +2,23 @@
 
 All notable changes to quirk, newest first.
 
+## v0.2.0
+
+### Changed
+- **The magic is read as an identity and a version.** A datagram opens with `QRK` (the identity) and a
+  one-byte packet-grammar version, parsed separately rather than compared as four bytes. `MAGIC` is no
+  longer public; `IDENTITY`, `VERSION` and `WireVersion` replace it. A datagram from another protocol
+  decodes as `DecodeError::Foreign`, and one from a quirk build speaking another grammar as
+  `DecodeError::Version`, so a log line can tell the two apart. `DecodeError::BadMagic` is gone.
+- **Undecodable datagrams are never answered.** A mismatch on this wire is dropped silently: the source
+  address of a UDP datagram can be forged, so an answer would let anyone aim quirk's replies at a third
+  party.
+
+### New
+- **`Connection::close`.** Drops a connection at once, without the graceful drain, for a node that has
+  decided a session must end now (for example, because the peer's access was revoked). The graceful path
+  is unchanged.
+
 ## v0.1.0
 
 The first release: a QUIC-style transport written from scratch, with connections, reliable streams, and
