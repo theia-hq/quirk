@@ -27,7 +27,7 @@ mod wire_tests;
 
 use core::net::{Ipv4Addr, SocketAddr};
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::collections::HashMap;
@@ -370,6 +370,11 @@ pub struct Connection {
     /// so [`wait_closed`](Connection::wait_closed) also waits for our outbound data to reach the peer
     /// before the caller may drop the connection (which would otherwise sever in-flight retransmits).
     drained: tokio::sync::watch::Receiver<bool>,
+    /// Set by [`close`](Connection::close), and read by both stream halves on every poll.
+    severed: Arc<AtomicBool>,
+    /// The receive and send engines, which [`close`](Connection::close) stops. Dropping the connection
+    /// leaves them running on purpose (see [`wait_closed`](Connection::wait_closed)).
+    engines: [tokio::task::AbortHandle; 2],
 }
 
 impl Connection {
@@ -387,8 +392,9 @@ impl Connection {
         let (ack_tx, ack_rx) = mpsc::channel(ACK_CAPACITY);
         let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
         let (drained_tx, drained_rx) = tokio::sync::watch::channel(false);
+        let severed = Arc::new(AtomicBool::new(false));
 
-        tokio::spawn(
+        let dispatcher = tokio::spawn(
             Dispatcher {
                 inbound,
                 socket: Arc::clone(&socket),
@@ -399,8 +405,9 @@ impl Connection {
                 closed: closed_tx,
             }
             .run(),
-        );
-        tokio::spawn(
+        )
+        .abort_handle();
+        let sender = tokio::spawn(
             Sender {
                 socket: Arc::clone(&socket),
                 peer_addr,
@@ -409,7 +416,8 @@ impl Connection {
                 drained: drained_tx,
             }
             .run(),
-        );
+        )
+        .abort_handle();
 
         Self {
             socket,
@@ -419,11 +427,35 @@ impl Connection {
             peer_key,
             datagrams: datagram_rx,
             stream: Mutex::new(Some((
-                SendStream { inner: send_user },
-                RecvStream { inner: recv_user },
+                SendStream {
+                    inner: send_user,
+                    severed: Arc::clone(&severed),
+                },
+                RecvStream {
+                    inner: recv_user,
+                    severed: Arc::clone(&severed),
+                },
             ))),
             closed: closed_rx,
             drained: drained_rx,
+            severed,
+            engines: [dispatcher, sender],
+        }
+    }
+
+    /// End the connection now, abruptly: both engines stop, so every byte not yet delivered is dropped,
+    /// and the stream halves, wherever they are held, fail from here on rather than read a clean end.
+    /// Idempotent. [`wait_closed`](Connection::wait_closed) resolves, since the engines that would
+    /// have signalled it are gone.
+    ///
+    /// THE PEER IS NOT TOLD: the wire has no close frame yet, so it learns only by its own silence
+    /// handling. That frame is the proper close on quirk's roadmap.
+    pub fn close(&self) {
+        // Flag first, then stop: the engines' ends dropping is what wakes a parked half, and it must
+        // find the flag already set, or it would read the dropped end as a clean EOF.
+        self.severed.store(true, Ordering::Release);
+        for engine in &self.engines {
+            engine.abort();
         }
     }
 
@@ -456,6 +488,9 @@ impl Connection {
 
     /// Take the connection's bidirectional stream: a write half and a read half. Available once.
     pub fn open_bi(&self) -> Result<(SendStream, RecvStream), Error> {
+        if self.severed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
         // The stream lock guards only an infallible `Option::take`, so it is never poisoned; the expect
         // is unreachable.
         #[allow(clippy::expect_used)]
@@ -511,6 +546,7 @@ impl Drop for Connection {
 /// connection's send engine; `shutdown` finishes the stream.
 pub struct SendStream {
     inner: DuplexStream,
+    severed: Arc<AtomicBool>,
 }
 
 impl AsyncWrite for SendStream {
@@ -519,21 +555,39 @@ impl AsyncWrite for SendStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        let this = self.get_mut();
+        if this.severed.load(Ordering::Acquire) {
+            return Poll::Ready(Err(severed_error(io::ErrorKind::BrokenPipe)));
+        }
+        Pin::new(&mut this.inner).poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        if this.severed.load(Ordering::Acquire) {
+            return Poll::Ready(Err(severed_error(io::ErrorKind::BrokenPipe)));
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        if this.severed.load(Ordering::Acquire) {
+            return Poll::Ready(Err(severed_error(io::ErrorKind::BrokenPipe)));
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
+}
+
+/// The error a half of a closed connection returns, never a clean end.
+fn severed_error(kind: io::ErrorKind) -> io::Error {
+    io::Error::new(kind, "connection closed")
 }
 
 /// The readable half of a quirk stream, delivering reassembled bytes until the peer finishes.
 pub struct RecvStream {
     inner: DuplexStream,
+    severed: Arc<AtomicBool>,
 }
 
 impl AsyncRead for RecvStream {
@@ -542,7 +596,11 @@ impl AsyncRead for RecvStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        let this = self.get_mut();
+        if this.severed.load(Ordering::Acquire) {
+            return Poll::Ready(Err(severed_error(io::ErrorKind::ConnectionAborted)));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
     }
 }
 
