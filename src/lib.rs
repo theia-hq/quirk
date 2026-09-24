@@ -1,9 +1,8 @@
 //! quirk: a QUIC-shaped transport over UDP, written from scratch.
 //!
 //! A from-scratch, QUIC-shaped transport implemented to learn networking internals rather than wrap
-//! an existing stack (it is not built on quinn). quirk is standalone and knows nothing about bifrost;
-//! a separate `bifrost-quirk` adapter maps it onto the bifrost transport interface, exactly as
-//! `bifrost-iroh` wraps iroh.
+//! an existing stack (it is not built on quinn). quirk is standalone and knows nothing about the
+//! crates built on it: a transport abstraction adapts it from the outside, the same way it wraps iroh.
 //!
 //! Identity is an ed25519 public key. Phase 0 (in progress): a plaintext transport over UDP. Done so
 //! far: the wire codec, a two-message handshake, a socket demultiplexer (one background task owns the
